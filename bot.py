@@ -1,688 +1,653 @@
-#!/usr/bin/env python3
-"""
-Wave Up - TRX Prediction Bot
-Formula: Hybrid Adaptive (W=10, LB=50) + Pattern Memory + Trap Detection
-  - Uses Momentum(10) as base
-  - Tie at W=10 → check W=41~50 → still tie → check W=50
-  - Tracks recent momentum accuracy over last 50 predictions
-  - If momentum accuracy < 50%, auto-switches to anti-momentum (reverse)
-  - Pattern Memory: tracks repeating B/S sequences → predicts next
-  - Trap Detection: detects extreme one-sided streaks → reverses safely
-  - Post-win caution: extra trap check for 3 rounds after every WIN
-Topic: https://t.me/c/2383423317/282961
-
-- State persistence (survives restart)
-- File-based dedup (prevents duplicate messages across restarts/overlaps)
-- Win→counter 1, Loss→counter 2,3,4...
-- Mode: {N}=Normal {R}=Reverse {T}=Trap {P}=Pattern
-"""
-
-import os
-import sys
-import requests
-import json
-import hashlib
-import datetime
-import time
-import logging
-
-# ── Load path from env ───────────────────────────────────────────────────────
-_monitor_path = os.environ.get('BOT_MONITOR_PATH', '')
-if _monitor_path and _monitor_path not in sys.path:
-    sys.path.insert(0, _monitor_path)
-
-try:
-    from bot_monitor import BotMonitor
-except ImportError:
-    class BotMonitor:
-        def __init__(self, name): pass
-        def check_api_error(self, msg): pass
-        def check_signal_sent(self, ok): pass
-
+import os,sys,requests,json,hashlib,datetime,time,logging,base64
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-TOKEN    = os.environ.get('BOT_TOKEN',  '8774016221:AAGN3Ue10KPdlKXxCgnYHncgOQ1mVhwSnUI')
-CHAT_ID  = os.environ.get('CHAT_ID',    '-1002383423317')
-TOPIC    = int(os.environ.get('TOPIC',   '282961'))
-LOGIN_ID = os.environ.get('LOGIN_ID',   '959969637971')
-PASSWORD = os.environ.get('PASSWORD',   'Waiyan203654')
+TOKEN    = os.environ.get('BOT_TOKEN','8774016221:AAGN3Ue10KPdlKXxCgnYHncgOQ1mVhwSnUI')
+CHAT_ID  = os.environ.get('CHAT_ID','-1002383423317')
+TOPIC    = int(os.environ.get('TOPIC','282961'))
+LOGIN_ID = os.environ.get('LOGIN_ID','959969637971')
+PASSWORD = os.environ.get('PASSWORD','Waiyan203654')
 API_BASE = "https://6lotteryapi.com/api/webapi"
+STATE_FILE   = 'wai1_state.json'
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN','')
+GITHUB_REPO  = 'rkarmin636-commits/Wave-Up-Bot'
+EXPORT_FILE  = 'bot_state_export.json'
+EXPORT_EVERY = 10
+ROLLING_MAX  = 500
+PHASE2_START = 200
+PHASE3_START = 500
+RECAL_P2=50; RECAL_P3=100
+SEQ3_CONF_B,SEQ3_CONF_S=0.57,0.55
+SEQ4_CONF_B,SEQ4_CONF_S=0.60,0.58
+SEQ5_CONF_B,SEQ5_CONF_S=0.62,0.60
+SEQ3_MIN_N=2; SEQ4_MIN_N=2; SEQ5_MIN_N=1
+STREAK_CONF_B=0.57; STREAK_CONF_S=0.55
+PW_SEQ3_CONF_B,PW_SEQ3_CONF_S=0.64,0.62
+PW_SEQ4_CONF_B,PW_SEQ4_CONF_S=0.67,0.65
+PW_SEQ5_CONF_B,PW_SEQ5_CONF_S=0.70,0.68
+PW_STREAK_CONF_B=0.64; PW_STREAK_CONF_S=0.62
+CONF_FLOOR=0.55; ANTI_MOM_W=10; POST_WIN_ROUNDS=3
+MINI_RECAL_WINDOW=50; EMERGENCY_RECAL_AT=3; FORCE_SWITCH_AT=5
+ACCURACY_WINDOW=20; ACCURACY_FLOOR=0.45
+PREDICTOR_TRACK_N=30; PREDICTOR_MIN_PREDS=10
+BASE_WEIGHTS={'S5':4.0,'S4':3.0,'S3':2.5,'ST':2.0,'SW':1.5,'AM':0.8}
+SIGNAL_COOLDOWN=55
+REV_PROB={
+    'B':{1:0.45,2:0.48,3:0.52,4:0.65,5:0.70,6:0.55,7:0.40,8:0.35},
+    'S':{1:0.45,2:0.48,3:0.52,4:0.58,5:0.74,6:0.60,7:0.45,8:0.38},
+}
+REV_WARNING_THRESHOLD=0.60; MOM_THRESHOLD=0.42
 
-STATE_FILE = 'wai1_state.json'
+logging.basicConfig(level=logging.INFO,format='%(asctime)s - %(levelname)s - %(message)s',handlers=[logging.StreamHandler(sys.stdout)])
+logger=logging.getLogger(__name__)
 
-HYBRID_WINDOW = 10      # Momentum window size
-HYBRID_LOOKBACK = 50    # How many recent momentum results to track
-
-# ── Pattern Memory ────────────────────────────────────────────────────────────
-PATTERN_SEQ_LEN   = 4   # Sequence length to match (e.g. BBSS)
-PATTERN_MIN_HITS  = 3   # Min occurrences before trusting a pattern
-PATTERN_CONF_MIN  = 0.65  # Min confidence to use pattern vote (65%)
-
-# ── Trap Detection ────────────────────────────────────────────────────────────
-TRAP_STREAK_LEN   = 7   # Consecutive same-side streak = trap zone
-TRAP_W10_EXTREME  = 8   # W=10 one-side count >= this = post-win trap
-POST_WIN_CAUTION  = 3   # How many rounds after WIN to apply extra caution
-
-# ========== LOGGING ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('wai1_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
+def normalize_issue(issue):
+    try: return str(int(str(issue)))
+    except: return str(issue)
 
 class WaveUpBot:
     def __init__(self):
-        self.auth_token = None
-        self.fail_count = 0
-        self.monitor = BotMonitor("wave_up")
-
-        # ── Defaults ──────────────────────────────────────────────────────
-        self.last_issue = None
-        self.last_prediction = None
-        self.last_pred_issue = None
-        self.consecutive_losses = 0
-        self.bet_counter = 0
-        self.last_sent_sig = None
-        self.last_sent_win = None
-
-        # ── Hybrid Adaptive tracking ─────────────────────────────────────
-        self.momentum_results = []   # list of 1(correct) / 0(wrong) for pure momentum
-        self.last_momentum_pred = None  # what pure momentum predicted (before adaptive flip)
-
-        # ── Pattern Memory tracking ───────────────────────────────────────
-        self.result_history = []     # actual B/S results in order (oldest→newest)
-
-        # ── Trap / Post-win tracking ──────────────────────────────────────
-        self.post_win_rounds = 0     # counts rounds since last WIN (0 = not in caution)
-
+        self.auth_token=None; self.fail_count=0; self.last_issue=None
+        self.last_prediction=None; self.last_pred_issue=None; self.last_pred_mode=None
+        self.consecutive_losses=0; self.bet_counter=0
+        self.last_sent_sig=None; self.last_sent_win=None; self.last_sent_time=0.0
+        self.result_history=[]; self.total_results=0; self.bootstrapped=False
+        self.calibrated_patterns={}; self.last_calibration_at=0
+        self.wins=0; self.losses_total=0; self.post_win_rounds=0
+        self.pre_win_loss_streak=0; self.last_win_side=None
+        self.last_emergency_recal=0; self.last_bot_direction=None
+        self.prediction_log=[]
+        self.predictor_log={'S5':[],'S4':[],'S3':[],'ST':[],'SW':[],'AM':[]}
+        self.pred_count_b=0; self.pred_count_s=0
+        self.rev_warning_active=False; self.rev_warning_side=None
+        self.rev_warning_prob=0.0; self.rev_confirmed=False
         self._load_state()
-        logger.info("✅ Wave Up Bot Ready!")
+        logger.info(f"V5.16.2 Ready! history={len(self.result_history)} total={self.total_results} wins={self.wins} losses={self.losses_total}")
 
-    # ── State persistence ─────────────────────────────────────────────────
     def _save_state(self):
-        state = {
-            'consecutive_losses': self.consecutive_losses,
-            'bet_counter': self.bet_counter,
-            'last_prediction': self.last_prediction,
-            'last_pred_issue': self.last_pred_issue,
-            'last_issue': self.last_issue,
-            'last_sent_sig': self.last_sent_sig,
-            'last_sent_win': self.last_sent_win,
-            'momentum_results': self.momentum_results[-100:],
-            'last_momentum_pred': self.last_momentum_pred,
-            'result_history': self.result_history[-100:],
-            'post_win_rounds': self.post_win_rounds,
-        }
+        state={'consecutive_losses':self.consecutive_losses,'bet_counter':self.bet_counter,
+               'last_prediction':self.last_prediction,'last_pred_issue':self.last_pred_issue,
+               'last_pred_mode':self.last_pred_mode,'last_issue':self.last_issue,
+               'last_sent_sig':self.last_sent_sig,'last_sent_win':self.last_sent_win,
+               'last_sent_time':self.last_sent_time,'result_history':self.result_history,
+               'total_results':self.total_results,'post_win_rounds':self.post_win_rounds,
+               'pre_win_loss_streak':self.pre_win_loss_streak,'last_win_side':self.last_win_side,
+               'calibrated_patterns':self.calibrated_patterns,'last_calibration_at':self.last_calibration_at,
+               'wins':self.wins,'losses_total':self.losses_total,'bootstrapped':self.bootstrapped,
+               'last_emergency_recal':self.last_emergency_recal,'last_bot_direction':self.last_bot_direction,
+               'prediction_log':self.prediction_log[-50:],
+               'predictor_log':{k:v[-PREDICTOR_TRACK_N:] for k,v in self.predictor_log.items()},
+               'pred_count_b':self.pred_count_b,'pred_count_s':self.pred_count_s,
+               'rev_warning_active':self.rev_warning_active,'rev_warning_side':self.rev_warning_side,
+               'rev_warning_prob':self.rev_warning_prob}
         try:
-            tmp = STATE_FILE + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(state, f)
-            os.replace(tmp, STATE_FILE)
-        except Exception as e:
-            logger.warning(f"Failed to save state: {e}")
+            tmp=STATE_FILE+'.tmp'
+            with open(tmp,'w') as f: json.dump(state,f)
+            os.replace(tmp,STATE_FILE)
+        except Exception as e: logger.warning(f"Save state failed: {e}")
+        if self.total_results>0 and self.total_results%EXPORT_EVERY==0:
+            self._export_to_github()
 
     def _load_state(self):
         try:
             if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r') as f:
-                    state = json.load(f)
-                self.consecutive_losses = state.get('consecutive_losses', 0)
-                self.bet_counter = state.get('bet_counter', 0)
-                self.last_prediction = state.get('last_prediction', None)
-                self.last_pred_issue = state.get('last_pred_issue', None)
-                self.last_issue = state.get('last_issue', None)
-                self.last_sent_sig = state.get('last_sent_sig', None)
-                self.last_sent_win = state.get('last_sent_win', None)
-                self.momentum_results = state.get('momentum_results', [])
-                self.last_momentum_pred = state.get('last_momentum_pred', None)
-                self.result_history = state.get('result_history', [])
-                self.post_win_rounds = state.get('post_win_rounds', 0)
-                logger.info(
-                    f"📂 State loaded: losses={self.consecutive_losses}, "
-                    f"last_sig={self.last_sent_sig}, pred_issue={self.last_pred_issue}, "
-                    f"mom_history={len(self.momentum_results)}, "
-                    f"pat_history={len(self.result_history)}, post_win={self.post_win_rounds}"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to load state: {e}")
+                with open(STATE_FILE,'r') as f: state=json.load(f)
+                self.consecutive_losses=state.get('consecutive_losses',0)
+                self.bet_counter=state.get('bet_counter',0)
+                self.last_prediction=state.get('last_prediction',None)
+                self.last_pred_issue=state.get('last_pred_issue',None)
+                self.last_pred_mode=state.get('last_pred_mode',None)
+                self.last_issue=state.get('last_issue',None)
+                raw_sig=state.get('last_sent_sig',None)
+                self.last_sent_sig=normalize_issue(raw_sig) if raw_sig is not None else None
+                raw_win=state.get('last_sent_win',None)
+                self.last_sent_win=normalize_issue(raw_win) if raw_win is not None else None
+                self.last_sent_time=float(state.get('last_sent_time',0.0))
+                self.result_history=state.get('result_history',[])
+                self.total_results=state.get('total_results',len(self.result_history))
+                self.post_win_rounds=state.get('post_win_rounds',0)
+                self.pre_win_loss_streak=state.get('pre_win_loss_streak',0)
+                self.last_win_side=state.get('last_win_side',None)
+                self.calibrated_patterns=state.get('calibrated_patterns',{})
+                self.last_calibration_at=state.get('last_calibration_at',0)
+                self.wins=state.get('wins',0); self.losses_total=state.get('losses_total',0)
+                self.bootstrapped=state.get('bootstrapped',False)
+                self.last_emergency_recal=state.get('last_emergency_recal',0)
+                self.last_bot_direction=state.get('last_bot_direction',None)
+                self.prediction_log=state.get('prediction_log',[])
+                saved_plog=state.get('predictor_log',{})
+                for k in self.predictor_log: self.predictor_log[k]=saved_plog.get(k,[])
+                self.pred_count_b=state.get('pred_count_b',0)
+                self.pred_count_s=state.get('pred_count_s',0)
+                self.rev_warning_active=state.get('rev_warning_active',False)
+                self.rev_warning_side=state.get('rev_warning_side',None)
+                self.rev_warning_prob=state.get('rev_warning_prob',0.0)
+        except Exception as e: logger.warning(f"Load state failed: {e}")
 
-    # ── Signature ─────────────────────────────────────────────────────────
-    def _create_sig(self, data):
-        mutable = {k: v for k, v in data.items() if k not in ('signature', 'timestamp')}
-        s = json.dumps(mutable, sort_keys=True, separators=(',', ':'))
-        mutable['signature'] = hashlib.md5(s.encode()).hexdigest().upper()
-        mutable['timestamp'] = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    def _add_result(self,result):
+        self.result_history.append(result); self.total_results+=1
+        if len(self.result_history)>ROLLING_MAX: self.result_history=self.result_history[-ROLLING_MAX:]
+
+    def _log_predictor(self,mode,predicted,actual):
+        clean=mode.rstrip('*')
+        if clean in self.predictor_log:
+            self.predictor_log[clean].append((predicted,actual))
+            if len(self.predictor_log[clean])>PREDICTOR_TRACK_N:
+                self.predictor_log[clean]=self.predictor_log[clean][-PREDICTOR_TRACK_N:]
+
+    def _get_predictor_weight(self,mode):
+        clean=mode.rstrip('*'); log=self.predictor_log.get(clean,[])
+        if len(log)<PREDICTOR_MIN_PREDS: return 1.0
+        recent=log[-PREDICTOR_TRACK_N:]; correct=sum(1 for p,a in recent if p==a); acc=correct/len(recent)
+        if acc>=0.62: return 1.5
+        elif acc>=0.58: return 1.2
+        elif acc>=0.52: return 1.0
+        elif acc>=0.47: return 0.7
+        else: return 0.3
+
+    def _log_prediction(self,predicted,actual):
+        self.prediction_log.append((predicted,actual))
+        if len(self.prediction_log)>50: self.prediction_log=self.prediction_log[-50:]
+
+    def _recent_accuracy(self):
+        window=self.prediction_log[-ACCURACY_WINDOW:]
+        if len(window)<10: return 1.0
+        return sum(1 for p,a in window if p==a)/len(window)
+
+    def _check_accuracy_floor(self):
+        if self._recent_accuracy()<ACCURACY_FLOOR:
+            logger.warning("Accuracy below floor -> full recalibrate"); self.calibrate(); return True
+        return False
+
+    def _create_sig(self,data):
+        mutable={k:v for k,v in data.items() if k not in ('signature','timestamp')}
+        s=json.dumps(mutable,sort_keys=True,separators=(',',':'))
+        mutable['signature']=hashlib.md5(s.encode()).hexdigest().upper()
+        mutable['timestamp']=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         return mutable
 
-    # ── Login ─────────────────────────────────────────────────────────────
-    def login(self, max_retries=5):
+    def _get_current_streak(self):
+        hist=self.result_history
+        if not hist: return None,0
+        side=hist[-1]; length=0
+        for r in reversed(hist):
+            if r==side: length+=1
+            else: break
+        return side,length
+
+    def _get_rev_prob(self,side,length):
+        return REV_PROB.get(side,{}).get(min(length,8),0.50)
+
+    def _update_reversal_state(self,actual):
+        self.rev_confirmed=False
+        side,length=self._get_current_streak()
+        if side is None: return
+        prob=self._get_rev_prob(side,length)
+        if self.rev_warning_active:
+            if actual!=self.rev_warning_side:
+                self.rev_confirmed=True
+                logger.info(f"REV CONFIRMED: {self.rev_warning_side} broke -> {actual} (prob={self.rev_warning_prob:.0%})")
+            else:
+                logger.info(f"REV false alarm: {side} streak continues at {length}")
+            self.rev_warning_active=False; self.rev_warning_side=None; self.rev_warning_prob=0.0
+        if prob>=REV_WARNING_THRESHOLD and not self.rev_warning_active:
+            self.rev_warning_active=True; self.rev_warning_side=side; self.rev_warning_prob=prob
+            logger.info(f"REV WARNING: {side} streak={length} prob={prob:.0%}")
+
+    def _get_reversal_signal(self):
+        side,length=self._get_current_streak()
+        if side is None: return None,None,''
+        prob=self._get_rev_prob(side,length)
+        opposite='S' if side=='B' else 'B'
+        if self.rev_confirmed:
+            return opposite,'REV',f"\u2705Rev:{int(prob*100)}%"
+        if self.rev_warning_active and self.rev_warning_prob>=REV_WARNING_THRESHOLD:
+            return opposite,'WARN',f"\u26a0\ufe0fRev:{int(self.rev_warning_prob*100)}%"
+        if prob<=MOM_THRESHOLD:
+            return side,'MOM',"\U0001f525Mom"
+        return None,None,''
+
+    def login(self,max_retries=5):
         for attempt in range(max_retries):
             try:
-                data = {
-                    "language": 0, "logintype": "mobile", "phonetype": 0,
-                    "pwd": PASSWORD,
-                    "random": str(int(time.time() * 1_000_000)),
-                    "username": LOGIN_ID
-                }
-                r = requests.post(
-                    f"{API_BASE}/Login",
-                    json=self._create_sig(data),
-                    headers={'Content-Type': 'application/json',
-                             'Referer': 'https://www.6lottery.com/'},
-                    timeout=15
-                )
-                result = r.json()
-                if result.get('code') == 0 and result.get('data'):
-                    self.auth_token = result['data']['token']
-                    logger.info("✅ Login successful")
-                    return True
-                else:
-                    logger.warning(f"Login failed: {result.get('message', 'Unknown')}")
-            except requests.exceptions.Timeout:
-                logger.warning(f"Login timeout ({attempt+1}/{max_retries})")
-            except requests.exceptions.ConnectionError:
-                logger.warning(f"Login conn error ({attempt+1}/{max_retries})")
-            except Exception as e:
-                logger.warning(f"Login error: {e} ({attempt+1}/{max_retries})")
+                data={"language":0,"logintype":"mobile","phonetype":0,"pwd":PASSWORD,
+                      "random":str(int(time.time()*1_000_000)),"username":LOGIN_ID}
+                r=requests.post(f"{API_BASE}/Login",json=self._create_sig(data),
+                    headers={'Content-Type':'application/json','Referer':'https://www.6lottery.com/'},timeout=15)
+                result=r.json()
+                if result.get('code')==0 and result.get('data'):
+                    self.auth_token=result['data']['token']; logger.info("Login OK"); return True
+                logger.warning(f"Login failed: {result.get('message','?')}")
+            except Exception as e: logger.warning(f"Login error ({attempt+1}): {e}")
             time.sleep(3)
         return False
 
-    # ── Get Data ──────────────────────────────────────────────────────────
-    def get_live_data(self, max_retries=5):
-        if not self.auth_token and not self.login():
-            return None
+    def bootstrap_history(self):
+        if self.bootstrapped: logger.info("Already bootstrapped."); return True
+        logger.info("Bootstrapping 500 historical results...")
+        if not self.auth_token and not self.login(): logger.warning("Bootstrap: login failed"); return False
+        all_results=[]
+        try:
+            params={"pageSize":500,"pageNo":1,"typeId":13,"language":0,"random":str(int(time.time()*1_000_000))}
+            r=requests.post(f"{API_BASE}/GetTRXNoaverageEmerdList",json=self._create_sig(params),
+                headers={'Content-Type':'application/json','Authorization':f'Bearer {self.auth_token}','Referer':'https://www.6lottery.com/'},timeout=30)
+            result=r.json()
+            if result.get('code')==0 and result.get('data'): all_results=result['data']['data']['gameslist']
+        except Exception as e: logger.warning(f"Bootstrap error: {e}")
+        if len(all_results)<100:
+            all_results=[]
+            for page in range(1,11):
+                try:
+                    params={"pageSize":50,"pageNo":page,"typeId":13,"language":0,"random":str(int(time.time()*1_000_000))}
+                    r=requests.post(f"{API_BASE}/GetTRXNoaverageEmerdList",json=self._create_sig(params),
+                        headers={'Content-Type':'application/json','Authorization':f'Bearer {self.auth_token}','Referer':'https://www.6lottery.com/'},timeout=15)
+                    result=r.json()
+                    if result.get('code')==0 and result.get('data'):
+                        games=result['data']['data']['gameslist']
+                        if not games: break
+                        all_results.extend(games)
+                        if len(all_results)>=500: break
+                    else: break
+                    time.sleep(0.5)
+                except Exception as e: logger.warning(f"Bootstrap page {page} error: {e}"); break
+        if not all_results: logger.warning("Bootstrap: no data"); return False
+        all_results=list(reversed(all_results))[-500:]
+        parsed=[]
+        for g in all_results:
+            try:
+                num=int(g.get('number',-1))
+                if num>=0: parsed.append('B' if num>=5 else 'S')
+            except: continue
+        if len(parsed)<50: logger.warning("Bootstrap: not enough results"); return False
+        self.result_history=parsed[-ROLLING_MAX:]; self.total_results=len(self.result_history)
+        self.bootstrapped=True; logger.info(f"Bootstrap done: {len(self.result_history)} results")
+        self.calibrate(); self._save_state(); return True
 
+    def _build_weighted_counts(self,hist,seq_len):
+        n=len(hist); counts={}; cutoff=max(0,n-50)
+        for i in range(n-seq_len):
+            k=''.join(hist[i:i+seq_len]); nxt=hist[i+seq_len]; w=2.0 if i>=cutoff else 0.7
+            if k not in counts: counts[k]={'B':0.0,'S':0.0}
+            counts[k][nxt]+=w
+        return counts
+
+    def mini_calibrate(self,label="post-win"):
+        hist=self.result_history[-MINI_RECAL_WINDOW:]
+        if len(hist)<15: return
+        logger.info(f"Mini-calibrate [{label}] n={len(hist)}")
+        for seq_len in [3,4,5]:
+            counts=self._build_weighted_counts(hist,seq_len); good={}
+            conf_min_b=(SEQ3_CONF_B if seq_len==3 else SEQ4_CONF_B if seq_len==4 else SEQ5_CONF_B)
+            conf_min_s=(SEQ3_CONF_S if seq_len==3 else SEQ4_CONF_S if seq_len==4 else SEQ5_CONF_S)
+            for k,v in counts.items():
+                total=v['B']+v['S']
+                if total<1: continue
+                cb,cs=v['B']/total,v['S']/total
+                if cb>=conf_min_b: good[k]=('B',round(cb,4),int(total))
+                elif cs>=conf_min_s: good[k]=('S',round(cs,4),int(total))
+            key=str(seq_len); merged=dict(self.calibrated_patterns.get(key,{})); merged.update(good)
+            self.calibrated_patterns[key]=merged
+        self._save_state()
+
+    def calibrate(self):
+        hist=self.result_history; n=len(hist); logger.info(f"Calibrating {n} results...")
+        new_patterns={}
+        for seq_len,min_n in [(3,SEQ3_MIN_N),(4,SEQ4_MIN_N),(5,SEQ5_MIN_N)]:
+            counts=self._build_weighted_counts(hist,seq_len); good={}
+            conf_min_b=(SEQ3_CONF_B if seq_len==3 else SEQ4_CONF_B if seq_len==4 else SEQ5_CONF_B)
+            conf_min_s=(SEQ3_CONF_S if seq_len==3 else SEQ4_CONF_S if seq_len==4 else SEQ5_CONF_S)
+            for k,v in counts.items():
+                total=v['B']+v['S']
+                if total<min_n: continue
+                cb,cs=v['B']/total,v['S']/total
+                if cb>=conf_min_b: good[k]=('B',round(cb,4),int(total))
+                elif cs>=conf_min_s: good[k]=('S',round(cs,4),int(total))
+            new_patterns[str(seq_len)]=good
+        streak_stats={}; cutoff=max(0,n-50)
+        for streak_len in range(2,8):
+            for side in ['B','S']:
+                b_after=s_after=0.0; i=0
+                while i<=n-streak_len-1:
+                    if all(hist[i+j]==side for j in range(streak_len)):
+                        nxt=hist[i+streak_len]; w=2.0 if i>=cutoff else 0.7
+                        if nxt=='B': b_after+=w
+                        else: s_after+=w
+                        i+=streak_len
+                    else: i+=1
+                total=b_after+s_after
+                if total>=2:
+                    best='B' if b_after>s_after else 'S'; conf=max(b_after,s_after)/total
+                    threshold=STREAK_CONF_B if best=='B' else STREAK_CONF_S
+                    if conf>=threshold: streak_stats[f"{streak_len}{side}"]=(best,round(conf,4),int(total))
+        new_patterns['streak']=streak_stats
+        best_w=ANTI_MOM_W; best_acc=0.0
+        for w in range(5,20):
+            correct=total=0
+            for i in range(w,n):
+                window=hist[i-w:i]; b_cnt=window.count('B')
+                if b_cnt>w/2: pred='S'
+                elif b_cnt<w/2: pred='B'
+                else: continue
+                total+=1
+                if pred==hist[i]: correct+=1
+            if total>0:
+                acc=correct/total
+                if acc>best_acc: best_acc,best_w=acc,w
+        new_patterns['best_anti_w']=best_w; new_patterns['best_anti_acc']=round(best_acc,4)
+        new_patterns['b_pct']=round(hist.count('B')/n*100,2) if n>0 else 50.0
+        new_patterns['s_pct']=round(hist.count('S')/n*100,2) if n>0 else 50.0
+        rev_points={}
+        for side in ['B','S']:
+            for streak_len in range(1,9):
+                reversed_count=total_count=0
+                for i in range(n-streak_len-1):
+                    if all(hist[i+j]==side for j in range(streak_len)) and (i==0 or hist[i-1]!=side):
+                        total_count+=1
+                        if hist[i+streak_len]!=side: reversed_count+=1
+                if total_count>=3: rev_points[f"{side}{streak_len}"]=round(reversed_count/total_count,4)
+        new_patterns['rev_points']=rev_points
+        self.calibrated_patterns=new_patterns; self.last_calibration_at=self.total_results
+        self._save_state(); logger.info(f"Calibration done! B={new_patterns['b_pct']}% S={new_patterns['s_pct']}%")
+
+    def _should_calibrate(self):
+        n=self.total_results
+        if n<PHASE2_START: return False
+        since=n-self.last_calibration_at
+        return since>=(RECAL_P3 if n>=PHASE3_START else RECAL_P2)
+
+    def _get_phase(self):
+        n=self.total_results
+        if n>=PHASE3_START: return 3
+        elif n>=PHASE2_START: return 2
+        return 1
+
+    def _seq_lookup(self,seq_len,caution=False):
+        hist=self.result_history
+        if len(hist)<seq_len: return None,0.0,0
+        key=''.join(hist[-seq_len:]); pat=self.calibrated_patterns.get(str(seq_len),{})
+        if caution:
+            conf_min_b=(PW_SEQ3_CONF_B if seq_len==3 else PW_SEQ4_CONF_B if seq_len==4 else PW_SEQ5_CONF_B)
+            conf_min_s=(PW_SEQ3_CONF_S if seq_len==3 else PW_SEQ4_CONF_S if seq_len==4 else PW_SEQ5_CONF_S)
+        else:
+            conf_min_b=(SEQ3_CONF_B if seq_len==3 else SEQ4_CONF_B if seq_len==4 else SEQ5_CONF_B)
+            conf_min_s=(SEQ3_CONF_S if seq_len==3 else SEQ4_CONF_S if seq_len==4 else SEQ5_CONF_S)
+        if key in pat:
+            best,conf,cnt=pat[key]
+            threshold=conf_min_b if best=='B' else conf_min_s
+            if conf>=threshold: return best,conf,cnt
+        return None,0.0,0
+
+    def _streak_lookup(self,caution=False):
+        hist=self.result_history
+        if not hist: return None,0.0,0
+        side=hist[-1]; streak=1
+        for i in range(len(hist)-2,-1,-1):
+            if hist[i]==side: streak+=1
+            else: break
+        pat=self.calibrated_patterns.get('streak',{})
+        for sl in range(streak,1,-1):
+            k=f"{sl}{side}"
+            if k in pat:
+                vote,conf,cnt=pat[k]
+                if caution: threshold=PW_STREAK_CONF_B if vote=='B' else PW_STREAK_CONF_S
+                else: threshold=STREAK_CONF_B if vote=='B' else STREAK_CONF_S
+                if conf>=threshold and cnt>=2: return vote,conf,cnt
+                break
+        return None,0.0,0
+
+    def _anti_momentum(self,games):
+        w=self.calibrated_patterns.get('best_anti_w',ANTI_MOM_W)
+        if not games or len(games)<w: w=ANTI_MOM_W
+        try: b=sum(1 for i in range(w) if int(games[i].get('number',-1))>=5)
+        except: return None,0.0
+        acc=self.calibrated_patterns.get('best_anti_acc',0.55)
+        if b>w/2: return 'S',acc
+        elif b<w/2: return 'B',acc
+        return None,0.0
+
+    def _force_switch_prediction(self):
+        if self.last_bot_direction:
+            switched='B' if self.last_bot_direction=='S' else 'S'
+            logger.info(f"FORCE SWITCH loss={self.consecutive_losses} -> {switched}"); return switched
+        hist=self.result_history
+        return ('B' if hist[-1]=='S' else 'S') if hist else None
+
+    def predict(self,games):
+        phase=self._get_phase(); n=self.total_results; w=len(self.result_history)
+        caution=self.post_win_rounds>0
+        if self.consecutive_losses>=FORCE_SWITCH_AT:
+            forced=self._force_switch_prediction()
+            if forced: return forced,'FS',f"FORCE {n} w{w}",''
+        if phase==1 or not self.calibrated_patterns:
+            if not games or len(games)<ANTI_MOM_W:
+                return None,'N',f"collecting {n}/{PHASE2_START}",''
+            b=sum(1 for i in range(ANTI_MOM_W) if int(games[i].get('number',-1))>=5)
+            if b>ANTI_MOM_W/2: pred='S'
+            elif b<ANTI_MOM_W/2: pred='B'
+            else: pred='S' if self.result_history and self.result_history[-1]=='B' else 'B'
+            return pred,'AM',f"collecting {n}/{PHASE2_START}",''
+        v5,c5,n5=self._seq_lookup(5,caution); v4,c4,n4=self._seq_lookup(4,caution)
+        v3,c3,n3=self._seq_lookup(3,caution); vs,cs,ns=self._streak_lookup(caution)
+        va,ca=self._anti_momentum(games)
+        streak_switch_vote=None
+        if caution and self.pre_win_loss_streak>=3 and self.last_win_side:
+            streak_switch_vote='B' if self.last_win_side=='S' else 'S'
+        seq_vote=seq_conf=seq_n=None; seq_mode='AM'
+        if v5 and c5>=CONF_FLOOR: seq_vote,seq_conf,seq_n,seq_mode=v5,c5,n5,'S5'
+        elif v4 and c4>=CONF_FLOOR: seq_vote,seq_conf,seq_n,seq_mode=v4,c4,n4,'S4'
+        elif v3 and c3>=CONF_FLOOR: seq_vote,seq_conf,seq_n,seq_mode=v3,c3,n3,'S3'
+        candidates=[]
+        if seq_vote:
+            base_w=BASE_WEIGHTS.get(seq_mode,2.5); dyn_w=self._get_predictor_weight(seq_mode)
+            occ_m=0.5 if seq_n<5 else (0.8 if seq_n<15 else 1.0)
+            candidates.append((seq_vote,base_w*dyn_w*occ_m*seq_conf,seq_mode))
+        if vs and cs>=CONF_FLOOR:
+            base_w=BASE_WEIGHTS['ST']; dyn_w=self._get_predictor_weight('ST')
+            occ_m=0.5 if ns<5 else (0.8 if ns<15 else 1.0)
+            candidates.append((vs,base_w*dyn_w*occ_m*cs,'ST'))
+        if streak_switch_vote:
+            candidates.append((streak_switch_vote,BASE_WEIGHTS['SW']*self._get_predictor_weight('SW'),'SW'))
+        if va:
+            candidates.append((va,BASE_WEIGHTS['AM']*self._get_predictor_weight('AM')*ca,'AM'))
+        status=f"{n} w{w}"
+        if not candidates:
+            pred=va if va else ('S' if self.result_history and self.result_history[-1]=='B' else 'B')
+            return pred,'AM',status,''
+        votes_b=sum(wt for vote,wt,_ in candidates if vote=='B')
+        votes_s=sum(wt for vote,wt,_ in candidates if vote=='S')
+        total_v=votes_b+votes_s
+        b_pct=self.calibrated_patterns.get('b_pct',50.0)
+        if b_pct>52.0:
+            bias_penalty=min((b_pct-50.0)*0.015,0.08)
+            votes_b=votes_b*(1.0-bias_penalty)
+        rev_dir,rev_tag,rev_suffix=self._get_reversal_signal()
+        if rev_dir:
+            if rev_tag=='REV': rev_weight=5.0
+            elif rev_tag=='WARN': rev_weight=2.5
+            elif rev_tag=='MOM': rev_weight=2.0
+            else: rev_weight=0.0
+            if rev_weight>0:
+                if rev_dir=='B': votes_b+=rev_weight
+                else: votes_s+=rev_weight
+        if total_v>0 and abs(votes_b-votes_s)/total_v<0.15 and va and not rev_dir:
+            return va,'AM',status,''
+        if votes_b>votes_s: pred='B'
+        elif votes_s>votes_b: pred='S'
+        else: pred=max(candidates,key=lambda x:x[1])[0]
+        if rev_tag=='REV': mode='REV'
+        elif rev_tag=='MOM': mode='MOM'
+        else:
+            agreeing=[(v,wt,lbl) for v,wt,lbl in candidates if v==pred]
+            mode=max(agreeing,key=lambda x:x[1])[2] if agreeing else 'AM'
+            if caution and mode not in ('S5','FS'): mode+='*'
+        if pred=='B': self.pred_count_b+=1
+        else: self.pred_count_s+=1
+        self.rev_confirmed=False
+        return pred,mode,status,rev_suffix
+
+    def get_live_data(self,max_retries=5):
+        if not self.auth_token and not self.login(): return None
         for attempt in range(max_retries):
             try:
-                params = {
-                    "pageSize": 50, "pageNo": 1, "typeId": 13, "language": 0,
-                    "random": str(int(time.time() * 1_000_000))
-                }
-                r = requests.post(
-                    f"{API_BASE}/GetTRXNoaverageEmerdList",
-                    json=self._create_sig(params),
-                    headers={
-                        'Content-Type': 'application/json',
-                        'Authorization': f'Bearer {self.auth_token}',
-                        'Referer': 'https://www.6lottery.com/'
-                    },
-                    timeout=15
-                )
-                result = r.json()
-
-                if result.get('code') == 0 and result.get('data'):
-                    gameslist = result['data']['data']['gameslist']
-                    if gameslist:
-                        self.fail_count = 0
-                        return gameslist
-
-                elif result.get('code') in [4, 5]:
-                    logger.warning(f"🔄 API code {result.get('code')}, re-login...")
-                    self.auth_token = None
-                    if self.login():
-                        continue
-                    else:
-                        time.sleep(5)
-                        continue
-                else:
-                    logger.warning(f"API error: {result.get('code')}: {result.get('message', 'Unknown')}")
-
-            except requests.exceptions.Timeout:
-                logger.warning(f"Data timeout ({attempt+1}/{max_retries})")
-            except requests.exceptions.ConnectionError:
-                logger.warning(f"Data conn error ({attempt+1}/{max_retries})")
-            except json.JSONDecodeError:
-                logger.warning(f"JSON error ({attempt+1}/{max_retries})")
-            except Exception as e:
-                logger.warning(f"Data error: {e} ({attempt+1}/{max_retries})")
+                params={"pageSize":50,"pageNo":1,"typeId":13,"language":0,"random":str(int(time.time()*1_000_000))}
+                r=requests.post(f"{API_BASE}/GetTRXNoaverageEmerdList",json=self._create_sig(params),
+                    headers={'Content-Type':'application/json','Authorization':f'Bearer {self.auth_token}','Referer':'https://www.6lottery.com/'},timeout=15)
+                result=r.json()
+                if result.get('code')==0 and result.get('data'):
+                    self.fail_count=0; return result['data']['data']['gameslist']
+                elif result.get('code') in [4,5]:
+                    self.auth_token=None
+                    if self.login(): continue
+            except Exception as e: logger.warning(f"Data error ({attempt+1}): {e}")
             time.sleep(3)
-
-        self.fail_count += 1
-        if self.fail_count >= 2:
-            logger.warning("Too many failures, forcing re-login...")
-            self.auth_token = None
-            self.fail_count = 0
+        self.fail_count+=1
+        if self.fail_count>=2: self.auth_token=None; self.fail_count=0
         return None
 
-    # ── Telegram ──────────────────────────────────────────────────────────
-    def send_msg(self, text, max_retries=3):
+    def send_msg(self,text,max_retries=3):
         for attempt in range(max_retries):
             try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                    json={
-                        "chat_id": CHAT_ID,
-                        "text": text,
-                        "message_thread_id": TOPIC
-                    },
-                    timeout=10
-                )
-                result = r.json()
-                if result.get('ok'):
-                    logger.info(f"✅ Sent: {text[:50]}")
-                    self.monitor.check_signal_sent(True)
-                    return True
-                else:
-                    logger.warning(f"Telegram error: {result.get('description')}")
-                    self.monitor.check_signal_sent(False)
+                r=requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                    json={"chat_id":CHAT_ID,"text":text,"message_thread_id":TOPIC},timeout=15)
+                resp=r.json()
+                if resp.get('ok'): return True
+                logger.warning(f"Telegram error ({attempt+1}): {resp.get('description','?')}")
             except requests.exceptions.Timeout:
-                logger.warning(f"Telegram timeout ({attempt+1}/{max_retries})")
-            except requests.exceptions.ConnectionError:
-                logger.warning(f"Telegram conn error ({attempt+1}/{max_retries})")
-            except Exception as e:
-                logger.warning(f"Telegram error: {e} ({attempt+1}/{max_retries})")
+                logger.warning(f"Telegram timeout ({attempt+1})"); time.sleep(3); continue
+            except Exception as e: logger.warning(f"Telegram error ({attempt+1}): {e}")
             time.sleep(2)
         return False
 
-    # ── Pattern Memory ────────────────────────────────────────────────────
-    def pattern_memory_vote(self):
-        """
-        Scan result_history for the last PATTERN_SEQ_LEN sequence.
-        Count how many times that sequence appeared and what came after.
-        Returns: ('B'|'S'|None, confidence_float)
-        """
-        hist = self.result_history
-        seq_len = PATTERN_SEQ_LEN
-        if len(hist) < seq_len + 1:
-            return None, 0.0
-
-        key = tuple(hist[-seq_len:])
-        follow_b = 0
-        follow_s = 0
-
-        for i in range(len(hist) - seq_len - 1):
-            if tuple(hist[i:i + seq_len]) == key:
-                nxt = hist[i + seq_len]
-                if nxt == 'B':
-                    follow_b += 1
-                else:
-                    follow_s += 1
-
-        total = follow_b + follow_s
-        if total < PATTERN_MIN_HITS:
-            logger.info(f"🔵 Pattern '{' '.join(key)}': only {total} hits (need {PATTERN_MIN_HITS}) → skip")
-            return None, 0.0
-
-        conf_b = follow_b / total
-        conf_s = follow_s / total
-
-        if conf_b >= PATTERN_CONF_MIN:
-            logger.info(f"🔵 Pattern '{' '.join(key)}': B={follow_b}/{total} ({conf_b:.0%}) → vote B")
-            return 'B', conf_b
-        elif conf_s >= PATTERN_CONF_MIN:
-            logger.info(f"🔵 Pattern '{' '.join(key)}': S={follow_s}/{total} ({conf_s:.0%}) → vote S")
-            return 'S', conf_s
-        else:
-            logger.info(f"🔵 Pattern '{' '.join(key)}': B={follow_b} S={follow_s} → no clear vote")
-            return None, 0.0
-
-    # ── Trap Detection ────────────────────────────────────────────────────
-    def trap_detection(self, games):
-        """
-        Two trap checks:
-          A) Streak trap: last TRAP_STREAK_LEN results all same side → reverse
-          B) Post-win extreme: within POST_WIN_CAUTION rounds after WIN and
-             W=10 one-side >= TRAP_W10_EXTREME → reverse
-        Returns: (trapped: bool, trap_side: 'B'|'S'|None)
-        """
-        hist = self.result_history
-
-        # ── A) Pure streak trap ───────────────────────────────────────────
-        if len(hist) >= TRAP_STREAK_LEN:
-            recent = hist[-TRAP_STREAK_LEN:]
-            if all(r == 'B' for r in recent):
-                logger.info(f"🚨 Trap A: {TRAP_STREAK_LEN} consecutive B streak → reverse to S")
-                return True, 'B'
-            if all(r == 'S' for r in recent):
-                logger.info(f"🚨 Trap A: {TRAP_STREAK_LEN} consecutive S streak → reverse to B")
-                return True, 'S'
-
-        # ── B) Post-win extreme check ─────────────────────────────────────
-        if self.post_win_rounds > 0:
+    def _export_to_github(self):
+        token=GITHUB_TOKEN
+        if not token: return
+        try:
+            hist=self.result_history; n=len(hist); sc=hist.count('S'); bc=hist.count('B')
+            max_s=max_b=cs2=cb2=0
+            for r in hist:
+                if r=='S': cs2+=1; cb2=0; max_s=max(max_s,cs2)
+                else: cb2+=1; cs2=0; max_b=max(max_b,cb2)
+            cur_side=hist[-1] if hist else '?'; cur_len=0
+            for r in reversed(hist):
+                if r==cur_side: cur_len+=1
+                else: break
+            last20=hist[-20:] if n>=20 else hist; l20s=last20.count('S'); l20b=last20.count('B')
+            pred_acc={}
+            for mode,log in self.predictor_log.items():
+                if len(log)>=5:
+                    correct=sum(1 for p,a in log if p==a)
+                    pred_acc[mode]={'accuracy':round(correct/len(log),4),'total':len(log),'correct':correct}
+            def top5(key):
+                d={}
+                for k,v in sorted(self.calibrated_patterns.get(key,{}).items(),key=lambda x:x[1][1],reverse=True)[:5]:
+                    d[k]={'direction':v[0],'confidence':v[1],'count':v[2]}
+                return d
+            total_t=self.wins+self.losses_total; win_rate=round(self.wins/total_t*100,1) if total_t>0 else 0
+            pred_total=self.pred_count_b+self.pred_count_s
+            export={'version':'V5.16.2','exported_at':datetime.datetime.utcnow().isoformat()+'Z',
+                    'last_sent_sig':self.last_sent_sig,'last_sent_time':self.last_sent_time,
+                    'phase':self._get_phase(),'total_results':self.total_results,'rolling_window':n,
+                    'wins':self.wins,'losses_total':self.losses_total,'win_rate_pct':win_rate,
+                    'consecutive_losses':self.consecutive_losses,
+                    'prediction_distribution':{'b_predictions':self.pred_count_b,'s_predictions':self.pred_count_s,
+                        'b_pred_pct':round(self.pred_count_b/pred_total*100,1) if pred_total>0 else 0},
+                    'overall':{'small_count':sc,'big_count':bc,'small_pct':round(sc/n*100,1) if n else 0,'big_pct':round(bc/n*100,1) if n else 0},
+                    'last20':{'results':''.join(last20),'small':l20s,'big':l20b,'small_pct':round(l20s/len(last20)*100,1) if last20 else 0},
+                    'current_streak':{'side':cur_side,'length':cur_len},'max_streaks':{'max_small':max_s,'max_big':max_b},
+                    'last10_results':''.join(hist[-10:]) if n>=10 else ''.join(hist),
+                    'predictor_accuracy':pred_acc,
+                    'top_patterns':{'seq3':top5('3'),'seq4':top5('4'),'seq5':top5('5'),'streak':top5('streak')},
+                    'anti_momentum':{'best_window':self.calibrated_patterns.get('best_anti_w',10),'best_accuracy':self.calibrated_patterns.get('best_anti_acc',0)},
+                    'bias_monitor':{'b_pct':self.calibrated_patterns.get('b_pct',50.0),'s_pct':self.calibrated_patterns.get('s_pct',50.0)},
+                    'reversal_points':self.calibrated_patterns.get('rev_points',{})}
+            export_json=json.dumps(export,indent=2); sha=None
             try:
-                b_w10 = sum(
-                    1 for i in range(HYBRID_WINDOW)
-                    if int(games[i].get('number', -1)) >= 5
-                )
-                s_w10 = HYBRID_WINDOW - b_w10
-                if b_w10 >= TRAP_W10_EXTREME:
-                    logger.info(
-                        f"🚨 Trap B (post-win {self.post_win_rounds}): "
-                        f"W=10 B={b_w10}/10 extreme → reverse to S"
-                    )
-                    return True, 'B'
-                if s_w10 >= TRAP_W10_EXTREME:
-                    logger.info(
-                        f"🚨 Trap B (post-win {self.post_win_rounds}): "
-                        f"W=10 S={s_w10}/10 extreme → reverse to B"
-                    )
-                    return True, 'S'
-            except (ValueError, TypeError):
-                pass
+                r=requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{EXPORT_FILE}",
+                    headers={'Authorization':f'token {token}'},timeout=10)
+                if r.status_code==200: sha=r.json().get('sha')
+            except: pass
+            payload={'message':f'V5.16.2 export: {self.total_results} results W{self.wins}/L{self.losses_total} ({win_rate}%)',
+                     'content':base64.b64encode(export_json.encode()).decode()}
+            if sha: payload['sha']=sha
+            r=requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{EXPORT_FILE}",
+                headers={'Authorization':f'token {token}','Content-Type':'application/json'},json=payload,timeout=15)
+            if r.status_code in (200,201): logger.info(f"GitHub export OK: {self.total_results} results W{self.wins}/L{self.losses_total}")
+            else: logger.warning(f"GitHub export failed: {r.status_code}")
+        except Exception as e: logger.warning(f"GitHub export error: {e}")
 
-        return False, None
-
-    # ── Formula: Hybrid Adaptive + Voting System (W=10, LB=50) ─────────
-    def hybrid_adaptive_formula(self, games):
-        """
-        Balanced Voting System (3 equal votes):
-          Vote 1 — Momentum(10) + auto-reverse if accuracy < 50%
-          Vote 2 — Pattern Memory (only if conf >= 65% and hits >= 3)
-          Vote 3 — Trap Detection (streak trap + post-win extreme)
-
-          3/3 agree  → very strong signal
-          2/3 agree  → follow majority
-          1/1/1 split (all different — impossible with B/S so means
-                       2 say X, 1 abstains OR all 3 split)
-                     → fallback to momentum (safe default)
-
-        Mode labels:
-          {N}  = Momentum only
-          {R}  = Momentum reversed (accuracy < 50%)
-          {P}  = Pattern tipped the balance
-          {T}  = Trap tipped the balance
-          {PT} = Pattern + Trap both voted same (strongest)
-          {3}  = All 3 voted same (maximum confidence)
-        """
-        if not games or len(games) < HYBRID_WINDOW:
-            return None, None, 'N'
-
-        # ── VOTE 1: Momentum(10) ──────────────────────────────────────────
-        b_count = 0
-        for i in range(HYBRID_WINDOW):
-            try:
-                num = int(games[i].get('number', -1))
-                if num >= 5:
-                    b_count += 1
-            except (ValueError, TypeError):
-                return None, None, 'N'
-
-        if b_count > HYBRID_WINDOW / 2:
-            mom_pred = 'B'
-        elif b_count < HYBRID_WINDOW / 2:
-            mom_pred = 'S'
-        else:
-            # Tie at W=10 → check W=41~50
-            if len(games) >= 50:
-                try:
-                    b_count_mid = sum(
-                        1 for i in range(40, 50)
-                        if int(games[i].get('number', -1)) >= 5
-                    )
-                except (ValueError, TypeError):
-                    b_count_mid = 5
-
-                if b_count_mid > 5:
-                    mom_pred = 'B'
-                    logger.info(f"🔍 W=10 Tie → W=41~50: B={b_count_mid}/10 → {mom_pred}")
-                elif b_count_mid < 5:
-                    mom_pred = 'S'
-                    logger.info(f"🔍 W=10 Tie → W=41~50: B={b_count_mid}/10 → {mom_pred}")
-                else:
-                    # Still tie → W=50
-                    try:
-                        b_count_wide = sum(
-                            1 for i in range(50)
-                            if int(games[i].get('number', -1)) >= 5
-                        )
-                    except (ValueError, TypeError):
-                        b_count_wide = 25
-                    mom_pred = 'B' if b_count_wide >= 25 else 'S'
-                    logger.info(
-                        f"🔍 W=10 Tie → W=41~50 Tie → W=50: B={b_count_wide}/50 → {mom_pred}"
-                    )
-            else:
-                try:
-                    last_num = int(games[0].get('number', -1))
-                    mom_pred = 'B' if last_num >= 5 else 'S'
-                except (ValueError, TypeError):
-                    mom_pred = 'B'
-                logger.info(f"🔍 W=10 Tie (data<50) → most recent: {mom_pred}")
-
-        # Apply auto-reverse if momentum accuracy < 50%
-        if len(self.momentum_results) >= HYBRID_LOOKBACK:
-            recent_accuracy = sum(self.momentum_results[-HYBRID_LOOKBACK:]) / HYBRID_LOOKBACK
-            if recent_accuracy < 0.50:
-                mom_vote = 'S' if mom_pred == 'B' else 'B'
-                mom_reversed = True
-                logger.info(f"🔄 Momentum accuracy {recent_accuracy:.1%} < 50% → vote REVERSED to {mom_vote}")
-            else:
-                mom_vote = mom_pred
-                mom_reversed = False
-                logger.info(f"📈 Momentum accuracy {recent_accuracy:.1%} → vote {mom_vote}")
-        else:
-            mom_vote = mom_pred
-            mom_reversed = False
-            logger.info(f"📊 Momentum: building history ({len(self.momentum_results)}/{HYBRID_LOOKBACK}) → vote {mom_vote}")
-
-        # ── VOTE 2: Pattern Memory ────────────────────────────────────────
-        pat_vote, pat_conf = self.pattern_memory_vote()
-        # None = abstain (not enough data / no clear pattern)
-
-        # ── VOTE 3: Trap Detection ────────────────────────────────────────
-        trapped, trap_side = self.trap_detection(games)
-        if trapped and trap_side is not None:
-            trap_vote = 'S' if trap_side == 'B' else 'B'
-        else:
-            trap_vote = None  # abstain
-
-        # ── TALLY VOTES ───────────────────────────────────────────────────
-        votes_b = sum([
-            1 if mom_vote  == 'B' else 0,
-            1 if pat_vote  == 'B' else 0,
-            1 if trap_vote == 'B' else 0,
-        ])
-        votes_s = sum([
-            1 if mom_vote  == 'S' else 0,
-            1 if pat_vote  == 'S' else 0,
-            1 if trap_vote == 'S' else 0,
-        ])
-        active_votes = sum([1, pat_vote is not None, trap_vote is not None])
-
-        logger.info(
-            f"🗳️ Votes → Momentum:{mom_vote} | "
-            f"Pattern:{'abstain' if pat_vote is None else pat_vote} | "
-            f"Trap:{'abstain' if trap_vote is None else trap_vote} | "
-            f"B={votes_b} S={votes_s}"
-        )
-
-        # ── DECIDE ────────────────────────────────────────────────────────
-        # Count which extra votes (Pattern / Trap) agreed with momentum
-        pat_agrees  = (pat_vote  is not None and pat_vote  == mom_vote)
-        trap_agrees = (trap_vote is not None and trap_vote == mom_vote)
-        pat_opposes  = (pat_vote  is not None and pat_vote  != mom_vote)
-        trap_opposes = (trap_vote is not None and trap_vote != mom_vote)
-
-        if votes_b > votes_s:
-            prediction = 'B'
-        elif votes_s > votes_b:
-            prediction = 'S'
-        else:
-            # Perfect split or all abstained → safe default = momentum vote
-            prediction = mom_vote
-
-        # ── MODE LABEL ────────────────────────────────────────────────────
-        if pat_agrees and trap_agrees:
-            # All 3 agree
-            mode = '3'
-        elif pat_agrees and trap_vote is None:
-            mode = 'P' if not mom_reversed else 'R'
-        elif trap_agrees and pat_vote is None:
-            mode = 'T' if not mom_reversed else 'R'
-        elif pat_agrees and trap_opposes:
-            # Pattern sided with momentum, Trap opposed → majority wins (mom+pat)
-            mode = 'P'
-        elif trap_agrees and pat_opposes:
-            # Trap sided with momentum, Pattern opposed → majority wins (mom+trap)
-            mode = 'T'
-        elif pat_opposes and trap_opposes:
-            # Both Pattern and Trap oppose momentum → they win 2v1
-            mode = 'PT'
-        elif pat_vote is not None and trap_vote is not None and pat_vote != trap_vote:
-            # Pattern and Trap disagree with each other → only momentum active
-            mode = 'R' if mom_reversed else 'N'
-        elif mom_reversed:
-            mode = 'R'
-        else:
-            mode = 'N'
-
-        logger.info(f"✅ Final: {prediction} | Mode={mode} | B={votes_b} S={votes_s}")
-        return prediction, mom_pred, mode
-
-    # ── Main Loop ─────────────────────────────────────────────────────────
     def run(self):
-        logger.info("🚀 Wave Up Bot Running...")
-        logger.info(f"📡 Topic {TOPIC}")
-
+        logger.info("Wave Up Bot V5.16.2 Running...")
         while True:
             try:
-                games = self.get_live_data()
-
-                if not games or len(games) < HYBRID_WINDOW:
-                    logger.warning("No data, retrying in 10s...")
-                    time.sleep(10)
-                    continue
-
-                latest = games[0]
+                games=self.get_live_data()
+                if not games or len(games)<ANTI_MOM_W: time.sleep(10); continue
+                latest=games[0]
                 try:
-                    issue = str(latest.get('issueNumber'))
-                except (ValueError, TypeError):
-                    logger.warning("Invalid issue number")
-                    time.sleep(5)
-                    continue
-
-                try:
-                    current_num = int(latest.get('number', -1))
-                except (ValueError, TypeError):
-                    current_num = -1
-
-                if current_num < 0:
-                    time.sleep(5)
-                    continue
-
-                if self.last_issue == issue:
-                    time.sleep(5)
-                    continue
-
-                actual = 'B' if current_num >= 5 else 'S'
-                logger.info(f"📊 WU {issue}: {current_num}({actual})")
-
-                # ── Check previous prediction (WIN / LOSS) ────────────────
-                if self.last_pred_issue == issue and self.last_prediction:
-                    # Track pure momentum accuracy
-                    if self.last_momentum_pred is not None:
-                        mom_correct = 1 if self.last_momentum_pred == actual else 0
-                        self.momentum_results.append(mom_correct)
-                        # Keep list bounded
-                        if len(self.momentum_results) > 100:
-                            self.momentum_results = self.momentum_results[-100:]
-
-                    # ── Update result_history for Pattern Memory ──────────
-                    self.result_history.append(actual)
-                    if len(self.result_history) > 100:
-                        self.result_history = self.result_history[-100:]
-
-                    if self.last_prediction == actual:
-                        # ===== WIN =====
-                        self.consecutive_losses = 0
-                        self.bet_counter = 0
-                        self.post_win_rounds = POST_WIN_CAUTION  # start caution countdown
-                        if self.last_sent_win != issue:
-                            self.send_msg("🌈🏆🥇W I N🍾🍺🥃🍷🍸🍹🍻🥂")
-                            self.last_sent_win = issue
-                        logger.info(f"🎉 WIN! Counter reset to 1 | post-win caution={POST_WIN_CAUTION} rounds")
+                    raw_issue=str(latest.get('issueNumber','')); issue=normalize_issue(raw_issue)
+                    current_num=int(latest.get('number',-1))
+                except: time.sleep(5); continue
+                if current_num<0: time.sleep(5); continue
+                if self.last_issue==issue: time.sleep(5); continue
+                actual='B' if current_num>=5 else 'S'
+                logger.info(f"Trx {issue}: {current_num}({actual})")
+                if (self.last_pred_issue and normalize_issue(self.last_pred_issue)==issue and self.last_prediction):
+                    self._add_result(actual); self._log_prediction(self.last_prediction,actual)
+                    if self.last_pred_mode: self._log_predictor(self.last_pred_mode,self.last_prediction,actual)
+                    self._update_reversal_state(actual)
+                    if self.last_prediction==actual:
+                        self.pre_win_loss_streak=self.consecutive_losses; self.last_win_side=actual
+                        self.consecutive_losses=0; self.bet_counter=0; self.post_win_rounds=POST_WIN_ROUNDS
+                        self.wins+=1; self.last_emergency_recal=0
+                        if self.last_sent_win!=issue:
+                            win_sent=self.send_msg("\U0001f308\U0001f3c6\U0001f947W I N\U0001f37e\U0001f37a\U0001f943\U0001f377\U0001f378\U0001f379\U0001f37b\U0001f942")
+                            if win_sent: self.last_sent_win=issue
+                        self.mini_calibrate(label="post-win")
                     else:
-                        # ===== LOSS =====
-                        self.consecutive_losses += 1
-                        if self.post_win_rounds > 0:
-                            self.post_win_rounds -= 1
-                            logger.info(f"💔 LOSS #{self.consecutive_losses} (post-win caution left={self.post_win_rounds})")
-                        else:
-                            logger.info(f"💔 LOSS #{self.consecutive_losses} → next bet={self.consecutive_losses + 1}")
-
-                    self.last_prediction = None
-                    self.last_pred_issue = None
-                    self.last_momentum_pred = None
+                        self.consecutive_losses+=1; self.losses_total+=1
+                        if self.post_win_rounds>0: self.post_win_rounds-=1
+                        if self.consecutive_losses>=EMERGENCY_RECAL_AT and self.consecutive_losses!=self.last_emergency_recal:
+                            self.mini_calibrate(label=f"emergency-{self.consecutive_losses}"); self.last_emergency_recal=self.consecutive_losses
+                        self._check_accuracy_floor()
+                    self.last_prediction=None; self.last_pred_issue=None; self.last_pred_mode=None
+                    if self._should_calibrate(): self.calibrate()
                     self._save_state()
-
-                # ── Generate new prediction using Hybrid Adaptive ─────────
-                prediction, mom_pred, mode = self.hybrid_adaptive_formula(games)
-
+                # DUPLICATE FIX: check before predict()
+                next_issue_full=normalize_issue(str(int(issue)+1))
+                now=time.time()
+                if self.last_sent_sig==next_issue_full:
+                    logger.info(f"Already sent {next_issue_full[-3:]}, skip")
+                    self.last_issue=issue; self._save_state(); time.sleep(5); continue
+                if (now-self.last_sent_time)<SIGNAL_COOLDOWN:
+                    logger.info(f"Cooldown {now-self.last_sent_time:.0f}s, skip")
+                    self.last_issue=issue; self._save_state(); time.sleep(5); continue
+                prediction,mode,status,rev_suffix=self.predict(games)
                 if prediction is None:
-                    logger.info("⚠️ No prediction")
-                    self.last_issue = issue
-                    self._save_state()
-                    time.sleep(5)
-                    continue
-
-                pred_text = "BIG" if prediction == 'B' else "SMALL"
-
-                try:
-                    next_issue = str(int(issue) + 1)[-3:]
-                except (ValueError, TypeError):
-                    next_issue = "XXX"
-
-                self.bet_counter = self.consecutive_losses + 1
-
-                # ── File-based dedup: only send signal once per issue ─────
-                if self.last_sent_sig == issue:
-                    logger.info(f"⏭️ Signal for {issue} already sent, skip")
-                    self.last_issue = issue
-                    time.sleep(5)
-                    continue
-
-                signal_msg = (
-                    f"🎯Trx {next_issue} ♐️ {pred_text} {self.bet_counter}🍀\n"
-                    f"📊 Wave Up Formula {{{mode}}}"
-                )
-
-                if self.send_msg(signal_msg):
-                    logger.info(
-                        f"📤 Trx {next_issue} ♐️ {pred_text} {self.bet_counter}"
-                    )
-                    self.last_prediction = prediction
-                    self.last_momentum_pred = mom_pred
-                    self.last_pred_issue = str(int(issue) + 1)
-                    self.last_sent_sig = issue
-
-                self.last_issue = issue
-                self._save_state()
-                time.sleep(5)
-
-            except KeyboardInterrupt:
-                logger.info("🛑 Bot stopped by user")
-                raise
-            except Exception as e:
-                logger.error(f"❌ Main loop error: {type(e).__name__}: {e}")
-                self.monitor.check_api_error(str(e))
-                time.sleep(10)
-
+                    self.last_issue=issue; self._save_state(); time.sleep(5); continue
+                pred_text="BIG" if prediction=='B' else "SMALL"
+                next_issue=next_issue_full[-3:]; self.bet_counter=self.consecutive_losses+1
+                line1=f"\U0001f3afTrx {next_issue} \u2708\ufe0f {pred_text} {self.bet_counter} \u2708\ufe0f\U0001f340"
+                line2=f"\U0001f4ca Wave Up {{{mode}}} [{status}]"
+                if rev_suffix: line2+=f" {rev_suffix}"
+                signal_msg=f"{line1}\n{line2}"
+                sent=self.send_msg(signal_msg)
+                if sent:
+                    self.last_sent_sig=next_issue_full; self.last_sent_time=now
+                    self.last_prediction=prediction; self.last_pred_issue=next_issue_full
+                    self.last_pred_mode=mode; self.last_bot_direction=prediction
+                    logger.info(f"Signal: Trx {next_issue} {pred_text} [{mode}] W{self.wins}/L{self.losses_total}")
+                self.last_issue=issue; self._save_state(); time.sleep(5)
+            except KeyboardInterrupt: logger.info("Stopped"); raise
+            except Exception as e: logger.error(f"Loop error: {e}"); time.sleep(10)
 
 def main():
-    logger.info("Starting Wave Up Bot...")
-    bot = WaveUpBot()
-    while True:
-        try:
-            bot.run()
-        except KeyboardInterrupt:
-            logger.info("Bot terminated")
-            break
-        except Exception as e:
-            logger.error(f"🚨 Critical error: {type(e).__name__}: {e}")
-            logger.info("Restarting in 10 seconds...")
-            time.sleep(10)
-            bot.auth_token = None
-            bot.login()
+    bot=WaveUpBot()
+    try:
+        if not bot.bootstrap_history(): logger.warning("Bootstrap failed, continuing")
+    except Exception as e: logger.warning(f"Bootstrap exception: {e}")
+    bot.run()
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
