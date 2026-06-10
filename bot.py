@@ -22,7 +22,7 @@ BACKUP_FILE      = 'wai1_state.json'
 HISTORY_FILE     = 'trx_history.json'
 EXPORT_EVERY     = 10
 ROLLING_MAX      = 1000
-MIN_API_INTERVAL = 1.0
+MIN_API_INTERVAL = 0.3
 NET_BACKOFF_DELAYS = [10,20,40,80,120]
 NET_FAIL_RELOGIN   = 5
 _last_api_call     = 0.0
@@ -626,7 +626,7 @@ class WaveUpBot:
 
                 # ── Skip if already processed ──────────────────────────────
                 if self.last_issue == issue:
-                    time.sleep(2)
+                    time.sleep(0.5)
                     continue
 
                 actual = 'B' if current_num >= 5 else 'S'
@@ -729,7 +729,7 @@ class WaveUpBot:
 
                 self.last_issue = issue
                 self._save_state()
-                time.sleep(2)
+                time.sleep(0.5)
 
             except KeyboardInterrupt:
                 logger.info("Stopped")
