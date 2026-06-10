@@ -8,7 +8,7 @@ except ImportError:
 # ── Credentials ────────────────────────────────────────────────────────────────
 TOKEN    = os.environ.get('BOT_TOKEN',  '8508681928:AAGAWeNdJHQ9tuF2hsmNRqbQsxjSwJ5Ms38')
 CHAT_ID  = os.environ.get('CHAT_ID',   '-1002383423317')
-TOPIC    = int(os.environ.get('TOPIC', '282961'))
+TOPIC    = int(os.environ.get('TOPIC', '151937'))
 LOGIN_ID = os.environ.get('LOGIN_ID',  '959969637971')
 PASSWORD = os.environ.get('PASSWORD',  'Waiyan203654')
 # ───────────────────────────────────────────────────────────────────────────────
