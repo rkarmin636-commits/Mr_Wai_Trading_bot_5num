@@ -1,2 +1,8 @@
 [settings]
   python.github_attestations = false
+git add Mr_Wai_Trading_bot_5num.py
+git add TRX_Pattern_5num_FINAL.xlsx
+git add requirements.txt
+git add mise.toml
+git commit -m "Fix: migrate 5-number bot to Excel loading + disable mise attestations"
+git push
