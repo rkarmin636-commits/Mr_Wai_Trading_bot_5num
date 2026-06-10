@@ -692,15 +692,11 @@ class WaveUpBot:
                             pred_text = "BIG"
                             conf      = round(b_count / total * 100, 1)
                         else:
-                            # Exact tie — use opposite of last result as tiebreaker (NO SKIP)
-                            if self.result_history and self.result_history[-1] == 'B':
-                                pred      = 'S'
-                                pred_text = "SMALL"
-                            else:
-                                pred      = 'B'
-                                pred_text = "BIG"
-                            conf = 50.0
-                            logger.info(f"[PATTERN] {pattern_key} → TIE S={s_count} B={b_count} → tiebreaker={pred}")
+                            # Exact tie — Excel rule: always SMALL for ties
+                            pred      = 'S'
+                            pred_text = "SMALL"
+                            conf      = 50.0
+                            logger.info(f"[PATTERN] {pattern_key} → TIE S={s_count} B={b_count} → Excel rule: SMALL")
                         
                         if pred:
                             logger.info(f"[PATTERN] {pattern_key} → S={s_count} B={b_count} total={total} → {pred}")
