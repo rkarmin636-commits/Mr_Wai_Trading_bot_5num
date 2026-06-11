@@ -1,4 +1,4 @@
-import os,sys,requests,json,hashlib,datetime,time,logging,base64
+import os,sys,requests,json,hashlib,datetime,time,logging,base64,threading
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,9 +23,11 @@ HISTORY_FILE     = 'trx_history.json'
 EXPORT_EVERY     = 10
 ROLLING_MAX      = 1000
 MIN_API_INTERVAL = 0.3
+MIN_TG_INTERVAL  = 0.3
 NET_BACKOFF_DELAYS = [10,20,40,80,120]
 NET_FAIL_RELOGIN   = 5
 _last_api_call     = 0.0
+_last_tg_call      = 0.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +50,14 @@ def _rate_limit_api():
     if elapsed < MIN_API_INTERVAL:
         time.sleep(MIN_API_INTERVAL - elapsed)
     _last_api_call = time.time()
+
+def _rate_limit_tg():
+    global _last_tg_call
+    now     = time.time()
+    elapsed = now - _last_tg_call
+    if elapsed < MIN_TG_INTERVAL:
+        time.sleep(MIN_TG_INTERVAL - elapsed)
+    _last_tg_call = time.time()
 
 def _cleanup_tmp_file():
     tmp = STATE_FILE + '.tmp'
@@ -109,7 +119,7 @@ class WaveUpBot:
     def send_msg(self, text, max_retries=3, parse_mode=None):
         for attempt in range(max_retries):
             try:
-                _rate_limit_api()
+                _rate_limit_tg()
                 payload = {"chat_id": CHAT_ID, "text": text, "message_thread_id": TOPIC}
                 if parse_mode:
                     payload["parse_mode"] = parse_mode
@@ -134,8 +144,8 @@ class WaveUpBot:
                 else:
                     logger.warning(f"Telegram HTTP {r.status_code} ({attempt+1})")
             except requests.exceptions.Timeout:
-                logger.warning(f"Telegram timeout ({attempt+1})")
-                return False
+                logger.warning(f"Telegram timeout ({attempt+1}), retrying...")
+                continue
             except Exception as e:
                 logger.warning(f"Telegram error ({attempt+1}): {e}")
             time.sleep(2)
@@ -220,6 +230,7 @@ class WaveUpBot:
                     self.net_fail_count = 0
                     if not self.login():
                         return None
+                    continue
                 time.sleep(delay)
                 continue
         self.fail_count += 1
@@ -309,7 +320,6 @@ class WaveUpBot:
     def _build_state_dict(self):
         return {
             'consecutive_losses': self.consecutive_losses,
-            'bet_counter':        self.bet_counter,
             'last_issue':         self.last_issue,
             'last_sent_sig':      self.last_sent_sig,
             'last_sent_win':      self.last_sent_win,
@@ -343,8 +353,10 @@ class WaveUpBot:
             self._export_counter += 1
             if self._export_counter >= EXPORT_EVERY:
                 self._export_counter = 0
-                self._export_to_github()
-                self._save_trx_history()
+                t = threading.Thread(target=self._export_to_github, daemon=True)
+                t.start()
+                t2 = threading.Thread(target=self._save_trx_history, daemon=True)
+                t2.start()
 
     def _load_state(self):
         token = GITHUB_TOKEN
@@ -376,7 +388,6 @@ class WaveUpBot:
                 state = json.load(f)
             defaults = {
                 'consecutive_losses': 0,
-                'bet_counter':        0,
                 'last_issue':         None,
                 'last_sent_sig':      None,
                 'last_sent_win':      None,
@@ -647,7 +658,7 @@ class WaveUpBot:
                     continue
 
                 # ══ STEP 1: WIN/LOSS for CURRENT issue (FIRST — win msg before signal) ══
-                if self.last_sent_sig and normalize_issue(self.last_sent_sig) == issue:
+                if self.last_sent_sig and self.last_sent_sig == issue:
                     if hasattr(self, '_last_prediction') and self._last_prediction:
                         if self._last_prediction == actual:
                             # ── WIN ────────────────────────────────────────
@@ -665,7 +676,6 @@ class WaveUpBot:
                             # ── LOSS ───────────────────────────────────────
                             self.losses_total       += 1
                             self.consecutive_losses += 1
-                            self.bet_counter        += 1
                             logger.info(f"LOSS W={self.wins}/L={self.losses_total}")
                         self._last_prediction = None
 
