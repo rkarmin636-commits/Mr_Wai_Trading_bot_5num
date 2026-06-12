@@ -35,6 +35,8 @@ LIVE_WINDOW       = 20    # rolling window: last N rounds per pattern
 FLIP_THRESHOLD    = 0.40  # flip signal if live accuracy < 40%
 UPDATE_EVERY_LIVE = 50    # recalculate all patterns every N rounds
 PATTERN_OVERRIDES = {}    # live signal overrides {pattern_key: 'S' or 'B'}
+# ── Thread locks for global state (prevent race conditions) ──────────────────
+PATTERN_LOCK      = threading.Lock()  # protects PATTERN_OVERRIDES, PATTERN_TABLE
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── GitHub ZIP settings ───────────────────────────────────────────────────────
@@ -525,6 +527,8 @@ class WaveUpBot:
             tmp = PATTERN_LIVE_FILE + '.tmp'
             with open(tmp, 'w') as f:
                 json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data written to disk before atomic replace
             os.replace(tmp, PATTERN_LIVE_FILE)
         except Exception as e:
             logger.warning(f"Save pattern_live failed: {e}")
@@ -562,38 +566,39 @@ class WaveUpBot:
             acc  = wins / len(results)
 
             # Current effective signal for this pattern
-            if pattern_key in PATTERN_OVERRIDES:
-                cur_sig = PATTERN_OVERRIDES[pattern_key]
-            else:
-                match = PATTERN_TABLE.get(pattern_key)
-                if not match:
-                    continue
-                cur_sig = 'S' if match[0] >= match[1] else 'B'
+            with PATTERN_LOCK:  # THREAD LOCK: protect global state
+                if pattern_key in PATTERN_OVERRIDES:
+                    cur_sig = PATTERN_OVERRIDES[pattern_key]
+                else:
+                    match = PATTERN_TABLE.get(pattern_key)
+                    if not match:
+                        continue
+                    cur_sig = 'S' if match[0] >= match[1] else 'B'
 
-            if acc < FLIP_THRESHOLD:
-                # Flip the signal
-                new_sig   = 'B' if cur_sig == 'S' else 'S'
-                old_label = 'SMALL' if cur_sig == 'S' else 'BIG'
-                new_label = 'SMALL' if new_sig == 'S' else 'BIG'
-                PATTERN_OVERRIDES[pattern_key] = new_sig
-                # Reset window after flip so it learns fresh
-                entry['results'] = []
-                entry['flipped'] = True
-                entry['updated'] = today
-                self._recent_flips.append({
-                    'pattern': pattern_key,
-                    'old': old_label,
-                    'new': new_label,
-                    'acc': round(acc * 100, 1),
-                    'rounds': len(results),
-                })
-                logger.info(
-                    f"[FLIP] {pattern_key}: {old_label}→{new_label}  "
-                    f"LiveAcc={acc*100:.1f}% over {len(results)} rounds"
-                )
-            elif acc >= 0.70:
-                # High confidence — keep override if any, just update timestamp
-                entry['updated'] = today
+                if acc < FLIP_THRESHOLD:
+                    # Flip the signal
+                    new_sig   = 'B' if cur_sig == 'S' else 'S'
+                    old_label = 'SMALL' if cur_sig == 'S' else 'BIG'
+                    new_label = 'SMALL' if new_sig == 'S' else 'BIG'
+                    PATTERN_OVERRIDES[pattern_key] = new_sig
+                    # Reset window after flip so it learns fresh
+                    entry['results'] = []
+                    entry['flipped'] = True
+                    entry['updated'] = today
+                    self._recent_flips.append({
+                        'pattern': pattern_key,
+                        'old': old_label,
+                        'new': new_label,
+                        'acc': round(acc * 100, 1),
+                        'rounds': len(results),
+                    })
+                    logger.info(
+                        f"[FLIP] {pattern_key}: {old_label}→{new_label}  "
+                        f"LiveAcc={acc*100:.1f}% over {len(results)} rounds"
+                    )
+                elif acc >= 0.70:
+                    # High confidence — keep override if any, just update timestamp
+                    entry['updated'] = today
 
         if self._recent_flips:
             logger.info(f"[RECALC] {len(self._recent_flips)} pattern(s) flipped this cycle")
@@ -1233,20 +1238,24 @@ class WaveUpBot:
                                             self.wins += 1
                                             self.consecutive_losses = 0
                                             self.bet_counter        = 0
-                                            self._record_pattern_result(
-                                                self._last_pattern_key, True)
+                                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
+                                            if self._last_pattern_key:  # NULL CHECK: prevent crash if pattern is None
+                                                live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
+                                                self._record_pattern_result(live_key, True)
                                             logger.info(
                                                 f"[CATCH-UP] WIN on missed {g_iss}")
                                             if self.last_sent_win != g_iss:
                                                 self.last_sent_win = g_iss
                                                 self.send_msg(
-                                                    "🌈🏆🥇<b>W I N</b>🍾🍺🏅🍷🍸🍹🍻🥂",
+                                                    "🏆  <b>W I N</b>  🏆🔯☘️🎖🏅🍾🍻🥂🍷🍸",
                                                     parse_mode='HTML')
                                         else:
                                             self.losses_total       += 1
                                             self.consecutive_losses += 1
+                                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
+                                            live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
                                             self._record_pattern_result(
-                                                self._last_pattern_key, False)
+                                                live_key, False)
                                             logger.info(
                                                 f"[CATCH-UP] LOSS on missed {g_iss}")
                                         self._last_prediction  = None
@@ -1263,19 +1272,25 @@ class WaveUpBot:
                             self.wins += 1
                             self.consecutive_losses = 0
                             self.bet_counter        = 0
-                            self._record_pattern_result(self._last_pattern_key, True)
+                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
+                            if self._last_pattern_key:  # NULL CHECK: prevent crash if pattern is None
+                                live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
+                                self._record_pattern_result(live_key, True)
                             logger.info(f"WIN! W={self.wins}/L={self.losses_total}")
                             if self.last_sent_win != issue:
                                 self.last_sent_win = issue
                                 self.send_msg(
-                                    "🌈🏆🥇<b>W I N</b>🍾🍺🏅🍷🍸🍹🍻🥂",
+                                    "🏆  <b>W I N</b>  🏆🔯☘️🎖🏅🍾🍻🥂🍷🍸",
                                     parse_mode='HTML'
                                 )
                         else:
                             # ── LOSS ───────────────────────────────────────
                             self.losses_total       += 1
                             self.consecutive_losses += 1
-                            self._record_pattern_result(self._last_pattern_key, False)
+                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
+                            if self._last_pattern_key:  # NULL CHECK: prevent crash if pattern is None
+                                live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
+                                self._record_pattern_result(live_key, False)
                             logger.info(f"LOSS W={self.wins}/L={self.losses_total}")
                         self._last_prediction  = None
                         self._last_pattern_key = None
@@ -1288,55 +1303,57 @@ class WaveUpBot:
                 pred = None
                 if len(self.last_5_nums) == 5 and self.last_sent_sig != next_issue_full:
                     pattern_key = ','.join(str(n) for n in self.last_5_nums)
-                    match = PATTERN_TABLE.get(pattern_key)
+                    
+                    with PATTERN_LOCK:  # THREAD LOCK: protect global state during lookup
+                        match = PATTERN_TABLE.get(pattern_key)
 
-                    if match:
-                        s_count, b_count = match[0], match[1]
-                        total = s_count + b_count
+                        if match:
+                            s_count, b_count = match[0], match[1]
+                            total = s_count + b_count
 
-                        # ── Check live override first (self-learning flip) ──
-                        if pattern_key in PATTERN_OVERRIDES:
-                            pred      = PATTERN_OVERRIDES[pattern_key]
-                            pred_text = "SMALL" if pred == 'S' else "BIG"
-                            conf      = round(s_count / total * 100, 1) if total > 0 else 50.0
-                            logger.info(
-                                f"[PATTERN] {pattern_key} → OVERRIDE={pred} "
-                                f"(orig S={s_count} B={b_count})"
-                            )
-                        elif s_count > b_count:
-                            pred      = 'S'
-                            pred_text = "SMALL"
-                            conf      = round(s_count / total * 100, 1) if total > 0 else 50.0
-                        elif b_count > s_count:
-                            pred      = 'B'
-                            pred_text = "BIG"
-                            conf      = round(b_count / total * 100, 1)
+                            # ── Check live override first (self-learning flip) ──
+                            if pattern_key in PATTERN_OVERRIDES:
+                                pred      = PATTERN_OVERRIDES[pattern_key]
+                                pred_text = "SMALL" if pred == 'S' else "BIG"
+                                conf      = round(s_count / total * 100, 1) if total > 0 else 50.0
+                                logger.info(
+                                    f"[PATTERN] {pattern_key} → OVERRIDE={pred} "
+                                    f"(orig S={s_count} B={b_count})"
+                                )
+                            elif s_count > b_count:
+                                pred      = 'S'
+                                pred_text = "SMALL"
+                                conf      = round(s_count / total * 100, 1) if total > 0 else 50.0
+                            elif b_count > s_count:
+                                pred      = 'B'
+                                pred_text = "BIG"
+                                conf      = round(b_count / total * 100, 1)
+                            else:
+                                # Exact tie — Excel rule: always SMALL
+                                pred      = 'S'
+                                pred_text = "SMALL"
+                                conf      = 50.0
+                                logger.info(
+                                    f"[PATTERN] {pattern_key} → TIE S={s_count} B={b_count} → SMALL"
+                                )
+
+                            if pred:
+                                logger.info(
+                                    f"[PATTERN] {pattern_key} → S={s_count} B={b_count} "
+                                    f"total={total} → {pred}"
+                                )
                         else:
-                            # Exact tie — Excel rule: always SMALL
-                            pred      = 'S'
-                            pred_text = "SMALL"
-                            conf      = 50.0
+                            # Pattern not found — fallback: opposite of last result
+                            if self.result_history and self.result_history[-1] == 'B':
+                                pred      = 'S'
+                                pred_text = "SMALL"
+                            else:
+                                pred      = 'B'
+                                pred_text = "BIG"
+                            conf = 50.0
                             logger.info(
-                                f"[PATTERN] {pattern_key} → TIE S={s_count} B={b_count} → SMALL"
+                                f"[PATTERN] {pattern_key} → not found → fallback={pred}"
                             )
-
-                        if pred:
-                            logger.info(
-                                f"[PATTERN] {pattern_key} → S={s_count} B={b_count} "
-                                f"total={total} → {pred}"
-                            )
-                    else:
-                        # Pattern not found — fallback: opposite of last result
-                        if self.result_history and self.result_history[-1] == 'B':
-                            pred      = 'S'
-                            pred_text = "SMALL"
-                        else:
-                            pred      = 'B'
-                            pred_text = "BIG"
-                        conf = 50.0
-                        logger.info(
-                            f"[PATTERN] {pattern_key} → not found → fallback={pred}"
-                        )
 
                 if pred:
                     self.bet_counter = self.consecutive_losses + 1
@@ -1344,9 +1361,11 @@ class WaveUpBot:
                     bet_dir     = "B" if pred == "B" else "S"
                     bet_label   = f"{bet_dir}{self.bet_counter}"
                     pat_key     = ','.join(str(n) for n in self.last_5_nums)
+                    # Use last 3 numbers for live tracking (1K pattern space, not 100K)
+                    live_key = ','.join(str(n) for n in self.last_5_nums[-3:])
 
                     # ── Live accuracy string ───────────────────────────────
-                    live_str = self._get_live_acc_str(pat_key)
+                    live_str = self._get_live_acc_str(live_key)
                     acc_part = live_str if live_str else f"Acc:{conf}%"
 
                     # ── Pattern flip notification (embed in signal) ────────
@@ -1366,6 +1385,14 @@ class WaveUpBot:
                         f"{{ {bet_label} }} 💥</b>"
                     )
                     stats = f"📊  [Pattern:{pat_key} | {acc_part}]{flip_note}"
+                    
+                    # ── CRITICAL FIX: Save state BEFORE sending signal ──────────────
+                    # Prevents loss of prediction if bot crashes between signal and save
+                    self.last_issue = issue
+                    self._recalc_counter += 1  # Increment counter BEFORE save
+                    self._save_state()  # Save state before any Telegram message
+                    # ──────────────────────────────────────────────────────────────
+                    
                     sent  = self.send_msg(
                         f"{hdr}\n{body}\n{stats}", parse_mode='HTML'
                     )
@@ -1377,22 +1404,20 @@ class WaveUpBot:
                             f"Signal: Trx {next_issue_3d} {pred_text} {conf}% "
                             f"[{self.bet_counter}x] {acc_part}"
                         )
-
-                self.last_issue = issue
-                self._save_state()
-
-                # ── Self-learning: periodic pattern recalculation ─────────
-                self._recalc_counter += 1
-                if self._recalc_counter >= UPDATE_EVERY_LIVE:
-                    self._recalc_counter = 0
-                    logger.info(
-                        f"[SELF-LEARN] {UPDATE_EVERY_LIVE} rounds elapsed — "
-                        f"recalculating patterns..."
-                    )
-                    threading.Thread(
-                        target=self._recalculate_patterns, daemon=True
-                    ).start()
-                # ─────────────────────────────────────────────────────────
+                else:
+                    # No signal — just update and save
+                    self.last_issue = issue
+                    self._recalc_counter += 1
+                    if self._recalc_counter >= UPDATE_EVERY_LIVE:
+                        self._recalc_counter = 0
+                        logger.info(
+                            f"[SELF-LEARN] {UPDATE_EVERY_LIVE} rounds elapsed — "
+                            f"recalculating patterns..."
+                        )
+                        threading.Thread(
+                            target=self._recalculate_patterns, daemon=True
+                        ).start()
+                    self._save_state()
 
                 time.sleep(0.5)
 
