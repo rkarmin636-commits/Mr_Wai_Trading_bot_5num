@@ -66,19 +66,21 @@ def normalize_issue(issue):
 
 def _rate_limit_api():
     global _last_api_call
-    now     = time.time()
-    elapsed = now - _last_api_call
-    if elapsed < MIN_API_INTERVAL:
-        time.sleep(MIN_API_INTERVAL - elapsed)
-    _last_api_call = time.time()
+    with PATTERN_LOCK:  # Protect global access
+        now     = time.time()
+        elapsed = now - _last_api_call
+        if elapsed < MIN_API_INTERVAL:
+            time.sleep(MIN_API_INTERVAL - elapsed)
+        _last_api_call = time.time()
 
 def _rate_limit_tg():
     global _last_tg_call
-    now     = time.time()
-    elapsed = now - _last_tg_call
-    if elapsed < MIN_TG_INTERVAL:
-        time.sleep(MIN_TG_INTERVAL - elapsed)
-    _last_tg_call = time.time()
+    with PATTERN_LOCK:  # Protect global access
+        now     = time.time()
+        elapsed = now - _last_tg_call
+        if elapsed < MIN_TG_INTERVAL:
+            time.sleep(MIN_TG_INTERVAL - elapsed)
+        _last_tg_call = time.time()
 
 def _cleanup_tmp_file():
     tmp = STATE_FILE + '.tmp'
@@ -168,6 +170,7 @@ class WaveUpBot:
 
         # ── Self-Learning state ────────────────────────
         self._last_pattern_key = None   # pattern used for pending prediction
+        self._last_live_key    = None   # 3-number live tracking key (stored at prediction time)
         self.pattern_live      = {}     # {key: {'results':['W','L',...], 'updated':''}}
         self._recalc_counter   = 0      # counts rounds toward UPDATE_EVERY_LIVE
         self._recent_flips     = []     # patterns flipped in last recalculate cycle
@@ -205,9 +208,16 @@ class WaveUpBot:
                     except Exception as e:
                         logger.warning(f"Telegram JSON parse error ({attempt+1}): {e}")
                 elif r.status_code == 429:
-                    retry_after = int(r.headers.get('Retry-After', 5))
-                    logger.warning(f"Telegram rate limit, waiting {retry_after}s")
-                    time.sleep(retry_after)
+                    retry_after = r.headers.get('Retry-After', '5')
+                    try:
+                        # Try to parse as integer first (seconds)
+                        wait_seconds = int(retry_after)
+                    except (ValueError, TypeError):
+                        # Fall back to 5 seconds if unparseable (could be HTTP-date)
+                        wait_seconds = 5
+                        logger.warning(f"Unparseable Retry-After header: {retry_after} → using 5s")
+                    logger.warning(f"Telegram rate limit, waiting {wait_seconds}s")
+                    time.sleep(wait_seconds)
                     continue
                 else:
                     logger.warning(f"Telegram HTTP {r.status_code} ({attempt+1})")
@@ -341,9 +351,8 @@ class WaveUpBot:
             )
             result = r.json()
             all_results = (
-                result['data']['data']['gameslist']
-                if result.get('code') == 0 and result.get('data')
-                else []
+                result.get('data', {}).get('data', {}).get('gameslist', [])
+                if result.get('code') == 0 else []
             )
         except Exception as e:
             logger.warning(f"Bootstrap error: {e}")
@@ -364,9 +373,33 @@ class WaveUpBot:
                 logger.warning(f"Bootstrap parse error: {e}")
         if len(parsed) < 20:
             return False
-        self.result_history = parsed[-ROLLING_MAX:]
-        self.total_results  = len(self.result_history)
-        self.bootstrapped   = True
+        
+        # MERGE with existing history instead of truncating
+        # Preserve all previous results + only add NEW ones from bootstrap
+        old_history = self.result_history.copy() if hasattr(self, 'result_history') else []
+        old_total = len(old_history)
+        
+        # Combine: keep old data + add new data (avoid duplicates by checking last result)
+        if old_history and parsed:
+            # Skip overlapping results at the junction
+            overlap_idx = 0
+            for i, p in enumerate(parsed):
+                if p == old_history[-1]:
+                    overlap_idx = i + 1
+                    break
+            new_data = parsed[overlap_idx:]
+        else:
+            new_data = parsed
+        
+        merged_history = old_history + new_data
+        self.result_history = merged_history[-ROLLING_MAX:]  # Keep last ROLLING_MAX
+        self.total_results = len(self.result_history)
+        self.bootstrapped = True
+        
+        logger.info(
+            f"Bootstrap: Merged {old_total} existing + {len(new_data)} new → "
+            f"{len(self.result_history)} total results"
+        )
         
         # FIX: Store last 4 numbers (NOT 5) because run loop will append
         # the latest number again when it first processes it.
@@ -401,6 +434,7 @@ class WaveUpBot:
             'last_prediction':    self._last_prediction,
             # Self-learning state
             'last_pattern_key':   self._last_pattern_key,
+            'last_live_key':      self._last_live_key,  # Store live_key for consistent tracking
             'recalc_counter':     self._recalc_counter,
         }
 
@@ -471,6 +505,7 @@ class WaveUpBot:
                 'losses_total':       0,
                 'bootstrapped':       False,
                 'last_5_nums':        [],
+                'last_live_key':      None,  # Restore live_key for consistent tracking
             }
             for k, v in defaults.items():
                 setattr(self, k, state.get(k, v))
@@ -484,6 +519,7 @@ class WaveUpBot:
             self._last_prediction  = state.get('last_prediction', None)
             # Self-learning restore
             self._last_pattern_key = state.get('last_pattern_key', None)
+            self._last_live_key    = state.get('last_live_key', None)  # Restore live_key
             self._recalc_counter   = state.get('recalc_counter', 0)
             self._load_pattern_live()
             # Downloads run in background — do NOT block bot startup
@@ -682,10 +718,11 @@ class WaveUpBot:
             # Load pattern table from extracted Excel
             new_table = load_pattern_from_excel(EXCEL_LOCAL_PATH)
             if new_table:
-                PATTERN_TABLE = new_table
+                with PATTERN_LOCK:  # Protect global reassignment
+                    PATTERN_TABLE.clear()
+                    PATTERN_TABLE.update(new_table)
                 logger.info(
-                    f"[EXCEL-ZIP] PATTERN_TABLE updated: {len(PATTERN_TABLE)} patterns "
-                    f"(was embedded {len(PATTERN_TABLE)} patterns)"
+                    f"[EXCEL-ZIP] PATTERN_TABLE updated: {len(PATTERN_TABLE)} patterns"
                 )
             else:
                 logger.warning("[EXCEL-ZIP] Excel loaded but empty — keeping embedded table")
@@ -1238,10 +1275,9 @@ class WaveUpBot:
                                             self.wins += 1
                                             self.consecutive_losses = 0
                                             self.bet_counter        = 0
-                                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
-                                            if self._last_pattern_key:  # NULL CHECK: prevent crash if pattern is None
-                                                live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
-                                                self._record_pattern_result(live_key, True)
+                                            # Use stored live_key (captured at prediction time)
+                                            if self._last_live_key:  # NULL CHECK
+                                                self._record_pattern_result(self._last_live_key, True)
                                             logger.info(
                                                 f"[CATCH-UP] WIN on missed {g_iss}")
                                             if self.last_sent_win != g_iss:
@@ -1272,10 +1308,9 @@ class WaveUpBot:
                             self.wins += 1
                             self.consecutive_losses = 0
                             self.bet_counter        = 0
-                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
-                            if self._last_pattern_key:  # NULL CHECK: prevent crash if pattern is None
-                                live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
-                                self._record_pattern_result(live_key, True)
+                            # Use stored live_key (captured at prediction time)
+                            if self._last_live_key:  # NULL CHECK: prevent crash if pattern is None
+                                self._record_pattern_result(self._last_live_key, True)
                             logger.info(f"WIN! W={self.wins}/L={self.losses_total}")
                             if self.last_sent_win != issue:
                                 self.last_sent_win = issue
@@ -1287,13 +1322,13 @@ class WaveUpBot:
                             # ── LOSS ───────────────────────────────────────
                             self.losses_total       += 1
                             self.consecutive_losses += 1
-                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
-                            if self._last_pattern_key:  # NULL CHECK: prevent crash if pattern is None
-                                live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
-                                self._record_pattern_result(live_key, False)
+                            # Use stored live_key (captured at prediction time)
+                            if self._last_live_key:  # NULL CHECK: prevent crash if pattern is None
+                                self._record_pattern_result(self._last_live_key, False)
                             logger.info(f"LOSS W={self.wins}/L={self.losses_total}")
                         self._last_prediction  = None
                         self._last_pattern_key = None
+                        self._last_live_key    = None  # Clear after recording result
 
                 # ══ STEP 2: Signal for NEXT issue (sent within ~15s after win/loss) ══
                 self.last_5_nums.append(current_num)
@@ -1386,24 +1421,33 @@ class WaveUpBot:
                     )
                     stats = f"📊  [Pattern:{pat_key} | {acc_part}]{flip_note}"
                     
-                    # ── CRITICAL FIX: Save state BEFORE sending signal ──────────────
-                    # Prevents loss of prediction if bot crashes between signal and save
+                    # ── CRITICAL FIX: Update prediction state BEFORE saving ────────
+                    # Must store live_key at prediction time, before any save
+                    self.last_sent_sig     = next_issue_full
+                    self._last_prediction  = pred
+                    self._last_pattern_key = pat_key
+                    self._last_live_key    = live_key  # STORE live_key BEFORE save (so WIN/LOSS uses same key)
+                    
                     self.last_issue = issue
                     self._recalc_counter += 1  # Increment counter BEFORE save
-                    self._save_state()  # Save state before any Telegram message
+                    self._save_state()  # Save state with prediction info BEFORE Telegram send
                     # ──────────────────────────────────────────────────────────────
                     
                     sent  = self.send_msg(
                         f"{hdr}\n{body}\n{stats}", parse_mode='HTML'
                     )
+                    
                     if sent:
-                        self.last_sent_sig     = next_issue_full
-                        self._last_prediction  = pred
-                        self._last_pattern_key = pat_key
                         logger.info(
                             f"Signal: Trx {next_issue_3d} {pred_text} {conf}% "
                             f"[{self.bet_counter}x] {acc_part}"
                         )
+                    else:
+                        # Signal send failed — clear prediction state since we couldn't notify
+                        self.last_sent_sig     = None
+                        self._last_prediction  = None
+                        self._last_pattern_key = None
+                        self._last_live_key    = None
                 else:
                     # No signal — just update and save
                     self.last_issue = issue
