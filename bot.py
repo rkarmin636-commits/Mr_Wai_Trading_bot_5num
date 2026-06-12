@@ -483,11 +483,14 @@ class WaveUpBot:
             # Self-learning restore
             self._last_pattern_key = state.get('last_pattern_key', None)
             self._recalc_counter   = state.get('recalc_counter', 0)
-            # Download Excel ZIP from GitHub → extract → update PATTERN_TABLE
-            self._download_excel_zip_from_github()
-            # Restore pattern_live.json + state from bot ZIP
-            self._download_zip_from_github()
             self._load_pattern_live()
+            # Downloads run in background — do NOT block bot startup
+            threading.Thread(
+                target=self._download_excel_zip_from_github, daemon=True
+            ).start()
+            threading.Thread(
+                target=self._download_zip_from_github, daemon=True
+            ).start()
         except Exception as e:
             logger.warning(f"Load state failed: {e}")
 
@@ -1208,6 +1211,49 @@ class WaveUpBot:
                     self._save_state()
                     time.sleep(2)
                     continue
+
+                # ══ CATCH-UP: missed-round WIN/LOSS recovery ══════════════════════
+                # If current issue jumped past the one we signaled (e.g. 357→359,
+                # skipping 358), look 358's result up from the games history list
+                # so WIN/LOSS and pattern_live data are not lost.
+                if (self.last_sent_sig and self._last_prediction
+                        and self.last_sent_sig != issue):
+                    try:
+                        sig_int  = int(self.last_sent_sig)
+                        curr_int = int(issue)
+                        if curr_int > sig_int:
+                            for g in games[1:25]:
+                                g_iss = normalize_issue(
+                                    str(g.get('issueNumber', '')))
+                                if g_iss == self.last_sent_sig:
+                                    g_num = int(g.get('number', -1))
+                                    if g_num >= 0:
+                                        g_actual = 'B' if g_num >= 5 else 'S'
+                                        if self._last_prediction == g_actual:
+                                            self.wins += 1
+                                            self.consecutive_losses = 0
+                                            self.bet_counter        = 0
+                                            self._record_pattern_result(
+                                                self._last_pattern_key, True)
+                                            logger.info(
+                                                f"[CATCH-UP] WIN on missed {g_iss}")
+                                            if self.last_sent_win != g_iss:
+                                                self.last_sent_win = g_iss
+                                                self.send_msg(
+                                                    "🌈🏆🥇<b>W I N</b>🍾🍺🏅🍷🍸🍹🍻🥂",
+                                                    parse_mode='HTML')
+                                        else:
+                                            self.losses_total       += 1
+                                            self.consecutive_losses += 1
+                                            self._record_pattern_result(
+                                                self._last_pattern_key, False)
+                                            logger.info(
+                                                f"[CATCH-UP] LOSS on missed {g_iss}")
+                                        self._last_prediction  = None
+                                        self._last_pattern_key = None
+                                    break
+                    except Exception:
+                        pass
 
                 # ══ STEP 1: WIN/LOSS for CURRENT issue (FIRST — win msg before signal) ══
                 if self.last_sent_sig and self.last_sent_sig == issue:
