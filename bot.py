@@ -550,7 +550,7 @@ class WaveUpBot:
                     f"{len(PATTERN_OVERRIDES)} overrides active"
                 )
         except Exception as e:
-            logger.warning(f"Load pattern_live failed: {e}")
+            logger.debug(f"Load pattern_live failed: {e}")  # Reduce noise on first run
 
     def _save_pattern_live(self):
         """Persist tracking data + overrides to disk."""
@@ -1238,7 +1238,6 @@ class WaveUpBot:
                     continue
 
                 actual = 'B' if current_num >= 5 else 'S'
-                logger.info(f"Trx {issue}: {current_num}({actual})")
 
                 # ── Record to history ──────────────────────────────────────
                 self._add_result(actual)
@@ -1297,8 +1296,8 @@ class WaveUpBot:
                                         self._last_prediction  = None
                                         self._last_pattern_key = None
                                     break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[CATCH-UP] Error processing missed result: {e}")
 
                 # ══ STEP 1: WIN/LOSS for CURRENT issue (FIRST — win msg before signal) ══
                 if self.last_sent_sig and self.last_sent_sig == issue:
@@ -1336,8 +1335,8 @@ class WaveUpBot:
                     self.last_5_nums = self.last_5_nums[-5:]
 
                 pred = None
-                if len(self.last_5_nums) == 5 and self.last_sent_sig != next_issue_full:
-                    pattern_key = ','.join(str(n) for n in self.last_5_nums)
+                if len(self.last_5_nums) >= 4 and self.last_sent_sig != next_issue_full:
+                    pattern_key = ','.join(str(n) for n in self.last_5_nums[-5:])
                     
                     with PATTERN_LOCK:  # THREAD LOCK: protect global state during lookup
                         match = PATTERN_TABLE.get(pattern_key)
@@ -1351,7 +1350,7 @@ class WaveUpBot:
                                 pred      = PATTERN_OVERRIDES[pattern_key]
                                 pred_text = "SMALL" if pred == 'S' else "BIG"
                                 conf      = round(s_count / total * 100, 1) if total > 0 else 50.0
-                                logger.info(
+                                logger.debug(
                                     f"[PATTERN] {pattern_key} → OVERRIDE={pred} "
                                     f"(orig S={s_count} B={b_count})"
                                 )
@@ -1368,12 +1367,12 @@ class WaveUpBot:
                                 pred      = 'S'
                                 pred_text = "SMALL"
                                 conf      = 50.0
-                                logger.info(
+                                logger.debug(
                                     f"[PATTERN] {pattern_key} → TIE S={s_count} B={b_count} → SMALL"
                                 )
 
                             if pred:
-                                logger.info(
+                                logger.debug(
                                     f"[PATTERN] {pattern_key} → S={s_count} B={b_count} "
                                     f"total={total} → {pred}"
                                 )
@@ -1386,7 +1385,7 @@ class WaveUpBot:
                                 pred      = 'B'
                                 pred_text = "BIG"
                             conf = 50.0
-                            logger.info(
+                            logger.debug(
                                 f"[PATTERN] {pattern_key} → not found → fallback={pred}"
                             )
 
