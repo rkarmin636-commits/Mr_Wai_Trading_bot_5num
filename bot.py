@@ -441,6 +441,7 @@ class WaveUpBot:
             'last_pattern_key':   self._last_pattern_key,
             'last_live_key':      self._last_live_key,  # Store live_key for consistent tracking
             'recalc_counter':     self._recalc_counter,
+            'bet_counter':        self.bet_counter,
         }
 
     def _save_state(self):
@@ -511,6 +512,7 @@ class WaveUpBot:
                 'bootstrapped':       False,
                 'last_5_nums':        [],
                 'last_live_key':      None,  # Restore live_key for consistent tracking
+                'bet_counter':        0,
             }
             for k, v in defaults.items():
                 setattr(self, k, state.get(k, v))
@@ -600,7 +602,7 @@ class WaveUpBot:
 
         for pattern_key, entry in self.pattern_live.items():
             results = entry.get('results', [])
-            if len(results) < 8:   # minimum 8 samples before acting
+            if len(results) < 2:   # minimum 2 samples before acting
                 continue
 
             wins = results.count('W')
@@ -651,14 +653,20 @@ class WaveUpBot:
         ).start()
 
     def _get_live_acc_str(self, pattern_key):
-        """Return a concise live accuracy string for the signal message."""
+        """Return a concise live accuracy string for the signal message.
+        Pattern-level if >= 2 samples exist; else global session accuracy fallback."""
         entry   = self.pattern_live.get(pattern_key, {})
         results = entry.get('results', [])
-        if not results:
+        if len(results) >= 2:
+            wins = results.count('W')
+            acc  = round(wins / len(results) * 100, 1)
+            return f"LiveAcc:{acc}%({len(results)}r)"
+        # Option A fallback: global session accuracy
+        total = self.wins + self.losses_total
+        if total < 5:
             return None
-        wins  = results.count('W')
-        acc   = round(wins / len(results) * 100, 1)
-        return f"LiveAcc:{acc}%({len(results)}r)"
+        acc = round(self.wins / total * 100, 1)
+        return f"SessAcc:{acc}%({total}r)"
 
     def _download_excel_zip_from_github(self):
         """
@@ -1301,6 +1309,7 @@ class WaveUpBot:
                                                 f"[CATCH-UP] LOSS on missed {g_iss}")
                                         self._last_prediction  = None
                                         self._last_pattern_key = None
+                                        self._last_live_key    = None  # clear stale key
                                     break
                     except Exception as e:
                         logger.warning(f"[CATCH-UP] Error processing missed result: {e}")
@@ -1410,7 +1419,7 @@ class WaveUpBot:
 
                     # ── Pattern flip notification (embed in signal) ────────
                     flip_note = ""
-                    for flip in self._recent_flips:
+                    for flip in list(self._recent_flips):  # snapshot — thread-safe iterate
                         if flip['pattern'] == pat_key:
                             flip_note = (
                                 f"\n⚠️ Pattern updated: "
