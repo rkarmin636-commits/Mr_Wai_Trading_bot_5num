@@ -850,11 +850,11 @@ class WaveUpBot:
                     row[la_col - 1].value = acc
                     row[lu_col - 1].value = today
                     if dp_col:
-                        row[dp_col - 1].value = (row[dp_col - 1].value or 0) + len(results)
+                        row[dp_col - 1].value = len(results)
                     if lw_col:
-                        row[lw_col - 1].value = (row[lw_col - 1].value or 0) + wins
+                        row[lw_col - 1].value = wins
                     if ll_col:
-                        row[ll_col - 1].value = (row[ll_col - 1].value or 0) + losses
+                        row[ll_col - 1].value = losses
                     updated_count += 1
                 # Reflect override if signal was flipped
                 if str(pat_val) in PATTERN_OVERRIDES:
