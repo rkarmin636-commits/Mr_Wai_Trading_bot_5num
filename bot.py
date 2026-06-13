@@ -37,6 +37,7 @@ UPDATE_EVERY_LIVE = 50    # recalculate all patterns every N rounds
 PATTERN_OVERRIDES = {}    # live signal overrides {pattern_key: 'S' or 'B'}
 # ── Thread locks for global state (prevent race conditions) ──────────────────
 PATTERN_LOCK      = threading.Lock()  # protects PATTERN_OVERRIDES, PATTERN_TABLE
+RATE_LIMIT_LOCK   = threading.Lock()  # FIX: separate lock for rate limiting (don't block pattern lookups)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── GitHub ZIP settings ───────────────────────────────────────────────────────
@@ -66,7 +67,7 @@ def normalize_issue(issue):
 
 def _rate_limit_api():
     global _last_api_call
-    with PATTERN_LOCK:  # Protect global access
+    with RATE_LIMIT_LOCK:  # FIX: Use separate lock (don't block pattern lookups)
         now     = time.time()
         elapsed = now - _last_api_call
         if elapsed < MIN_API_INTERVAL:
@@ -75,7 +76,7 @@ def _rate_limit_api():
 
 def _rate_limit_tg():
     global _last_tg_call
-    with PATTERN_LOCK:  # Protect global access
+    with RATE_LIMIT_LOCK:  # FIX: Use separate lock (don't block pattern lookups)
         now     = time.time()
         elapsed = now - _last_tg_call
         if elapsed < MIN_TG_INTERVAL:
@@ -170,7 +171,7 @@ class WaveUpBot:
 
         # ── Self-Learning state ────────────────────────
         self._last_pattern_key = None   # pattern used for pending prediction
-        self._last_live_key    = None   # 3-number live tracking key (stored at prediction time)
+        self._last_live_key    = None   # 5-number live tracking key (stored at prediction time)
         self.pattern_live      = {}     # {key: {'results':['W','L',...], 'updated':''}}
         self._recalc_counter   = 0      # counts rounds toward UPDATE_EVERY_LIVE
         self._recent_flips     = []     # patterns flipped in last recalculate cycle
@@ -379,14 +380,18 @@ class WaveUpBot:
         old_history = self.result_history.copy() if hasattr(self, 'result_history') else []
         old_total = len(old_history)
         
-        # Combine: keep old data + add new data (avoid duplicates by checking last result)
+        # Combine: keep old data + add new data (avoid duplicates)
         if old_history and parsed:
-            # Skip overlapping results at the junction
+            # FIX: Use last 10 results as overlap signature (not single char)
             overlap_idx = 0
-            for i, p in enumerate(parsed):
-                if p == old_history[-1]:
-                    overlap_idx = i + 1
-                    break
+            overlap_len = min(10, len(old_history))
+            if overlap_len >= 3:
+                tail = old_history[-overlap_len:]
+                # Search for this tail sequence in parsed data
+                for start in range(len(parsed) - overlap_len + 1):
+                    if parsed[start:start + overlap_len] == tail:
+                        overlap_idx = start + overlap_len
+                        break
             new_data = parsed[overlap_idx:]
         else:
             new_data = parsed
@@ -1287,10 +1292,11 @@ class WaveUpBot:
                                         else:
                                             self.losses_total       += 1
                                             self.consecutive_losses += 1
-                                            # Use last 3 numbers for live tracking (1K pattern space, not 100K)
-                                            live_key = ','.join(str(n) for n in self._last_pattern_key.split(',')[-3:])
-                                            self._record_pattern_result(
-                                                live_key, False)
+                                            # FIX: Use stored _last_live_key (same as WIN path, with null check)
+                                            if self._last_live_key:
+                                                self._record_pattern_result(self._last_live_key, False)
+                                            else:
+                                                logger.warning(f"[CATCH-UP] No live_key for LOSS on {g_iss}")
                                             logger.info(
                                                 f"[CATCH-UP] LOSS on missed {g_iss}")
                                         self._last_prediction  = None
@@ -1335,7 +1341,7 @@ class WaveUpBot:
                     self.last_5_nums = self.last_5_nums[-5:]
 
                 pred = None
-                if len(self.last_5_nums) >= 4 and self.last_sent_sig != next_issue_full:
+                if len(self.last_5_nums) >= 5 and self.last_sent_sig != next_issue_full:
                     pattern_key = ','.join(str(n) for n in self.last_5_nums[-5:])
                     
                     with PATTERN_LOCK:  # THREAD LOCK: protect global state during lookup
@@ -1395,8 +1401,8 @@ class WaveUpBot:
                     bet_dir     = "B" if pred == "B" else "S"
                     bet_label   = f"{bet_dir}{self.bet_counter}"
                     pat_key     = ','.join(str(n) for n in self.last_5_nums)
-                    # Use last 3 numbers for live tracking (1K pattern space, not 100K)
-                    live_key = ','.join(str(n) for n in self.last_5_nums[-3:])
+                    # FIX: Use FULL 5-number key for live tracking (matches PATTERN_TABLE)
+                    live_key = ','.join(str(n) for n in self.last_5_nums[-5:])
 
                     # ── Live accuracy string ───────────────────────────────
                     live_str = self._get_live_acc_str(live_key)
@@ -1429,6 +1435,16 @@ class WaveUpBot:
                     
                     self.last_issue = issue
                     self._recalc_counter += 1  # Increment counter BEFORE save
+                    # FIX: Check recalc threshold in BOTH branches (not just 'else')
+                    if self._recalc_counter >= UPDATE_EVERY_LIVE:
+                        self._recalc_counter = 0
+                        logger.info(
+                            f"[SELF-LEARN] {UPDATE_EVERY_LIVE} rounds elapsed — "
+                            f"recalculating patterns..."
+                        )
+                        threading.Thread(
+                            target=self._recalculate_patterns, daemon=True
+                        ).start()
                     self._save_state()  # Save state with prediction info BEFORE Telegram send
                     # ──────────────────────────────────────────────────────────────
                     
